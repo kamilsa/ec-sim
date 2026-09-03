@@ -1,0 +1,42 @@
+[package]
+name = "ec-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Shadow-compatible payload-propagation simulator"
+
+[[bin]]
+name = "ec-sim"
+path = "src/main.rs"
+
+# libp2p comes from the same kamilsa/rust-libp2p fork blobsim uses (partial
+# messages + per-topic `traffic()` byte counters). See blobsim's Cargo.toml
+# for the patch list on `blobsim-patches`.
+[dependencies]
+libp2p = { git = "https://github.com/kamilsa/rust-libp2p", rev = "f5f21b73ae24cc22a81eda87c1afb421ea02a178", features = [
+    "gossipsub",
+    "gossipsub-partial-messages",
+    "quic",
+    "dns",
+    "tokio",
+    "macros",
+    "request-response",
+] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+rand = "0.10"
+futures = "0.3"
+sha2 = "0.10"
+reed-solomon-erasure = "6"
+curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
+ed25519-dalek = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[patch.crates-io]
+quinn-udp = { path = "patch/quinn-udp" }

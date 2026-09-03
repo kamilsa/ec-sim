@@ -1,0 +1,36 @@
+[package]
+name = "quinn-udp"
+version = "0.5.14"
+edition = "2021"
+
+[features]
+# NOTE: Please keep this in sync with the feature list in `.github/workflows/codecov.yml`, see
+# comment in that file for more information.
+default = ["tracing", "log"]
+# Configure `tracing` to log events via `log` if no `tracing` subscriber exists.
+log = ["tracing/log"]
+direct-log = ["dep:log"]
+# Use private Apple APIs to send multiple packets in a single syscall.
+fast-apple-datapath = []
+
+[dependencies]
+libc = { version = "0.2" }
+log = { version = "0.4", optional = true }
+tracing = { version = "0.1", optional = true }
+
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+socket2 = { version = "0.5.9" }
+
+[build-dependencies]
+cfg_aliases = { version = "0.2.1" }
+
+[lib]
+# See https://github.com/bheisler/criterion.rs/blob/master/book/src/faq.md#cargo-bench-gives-unrecognized-option-errors-for-valid-command-line-options
+bench = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true

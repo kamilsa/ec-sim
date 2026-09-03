@@ -1,0 +1,72 @@
+# ecsim.toml — configuration for `uv run shadow-sim.py`.
+#
+# Describes a single Shadow simulation: how many nodes, how they are wired over
+# QUIC, and a geo-realistic network (per-host region, supernode class + EIP-7870
+# bandwidth, inter-region latency matrix + jitter).
+
+[run]
+# "docker" builds an image (ec-sim on top of [docker].shadow_image) and runs Shadow
+#          in a container — zero local setup beyond Docker.
+# "native" builds ec-sim with `cargo build --release` and runs a `shadow` binary
+#          found on PATH — requires Shadow installed locally (Linux).
+runner = "docker"
+
+[sim]
+mode = "gossipsub"            # gossipsub | rs-partial | rs-subnets | rlnc
+seed = 42                     # master RNG seed (topology + per-node keypairs)
+runs = 1                      # number of runs; run i uses seed+i
+payload_size_kib = 256        # payload the builder publishes once after warmup
+warmup_secs = 15              # extra wait after connections/mesh are ready
+observe_secs = 20             # window after publish before every node exits
+payload_chunk_recipients = 4  # rs-partial: mesh peers seeded per shard
+rlnc_chunks = 10              # RLNC source-packet count N
+rlnc_fanout = 40              # RLNC push degree D (independent of mesh_n)
+
+# Gossipsub fan-out. libp2p defaults flood_publish to true; Ethereum clients set
+# false. Zero lazy gossip so amplification does not dominate the comparison.
+flood_publish = false
+gossip_lazy = 0
+gossip_factor = 0.00
+
+# Mesh sizing. Must satisfy:
+#   mesh_outbound_min <= mesh_n_low <= mesh_n <= mesh_n_high   and   2*mesh_outbound_min <= mesh_n
+mesh_n_low = 6
+mesh_n = 8
+mesh_n_high = 12
+mesh_outbound_min = 2
+rust_log = "info"
+# stop_time = "90s"           # optional; default = warmup_secs + observe_secs + 60s
+
+[topology]
+nodes = 128                   # including the builder (node 0)
+peers_per_node = 50           # random QUIC peers each node dials
+
+# Geo-realistic network. A seeded fraction of hosts are supernodes with 1 Gbit
+# both ways. Other hosts use EIP-7870 bandwidth (50 Mbit down / 25 Mbit up).
+# Inter-host latency comes from a fixed inter-region matrix + per-edge jitter.
+[network]
+jitter_ratio = 0.3
+packet_loss = 0.0
+supernode_fraction = 0.05
+supernode_bandwidth_up = "1 Gbit"
+supernode_bandwidth_down = "1 Gbit"
+non_supernode_bandwidth_up = "25 Mbit"
+non_supernode_bandwidth_down = "50 Mbit"
+
+[network.regions]             # region -> weight (probability a host lands there)
+us-east = 0.30
+us-west = 0.15
+europe  = 0.25
+asia    = 0.20
+sa      = 0.05
+africa  = 0.05
+
+[docker]
+# Base image that ships Shadow (arm64). The :tcpfix tag on Docker Hub carries
+# the tcp_sendUserData 65535-byte send-cap fix used by blobsim.
+shadow_image = "kamilsa/shadow-arm:tcpfix"
+image_name = "ecsim-shadow:local"
+rebuild = false
+
+[output]
+dir = "shadow-output"
