@@ -18,7 +18,7 @@ use crate::coding::{
 };
 use crate::events::hex_bytes;
 use crate::network::{
-    build_swarm, column_from_topic, column_topic, dial_peers, gossip_byte_totals, keypair_from_seed,
+    build_swarm, column_from_topic, column_topic, content_message_id_for, dial_peers, gossip_byte_totals, keypair_from_seed,
     mesh_peer_count, payload_chunk_topic, payload_topic, subscribe_partial, GossipTuning, MeshTuning,
     SimBehaviour, SimBehaviourEvent, NUM_COLUMNS,
 };
@@ -554,6 +554,32 @@ fn publish_hybrid(swarm: &mut Swarm<SimBehaviour>, payload: &[u8], reconstructed
     mark_reconstructed(reconstructed, payload);
 }
 
+fn send_reconstructed_chunk_idontwants(
+    swarm: &mut Swarm<SimBehaviour>,
+    payload_len: usize,
+    shard_len: usize,
+    payload_hash: [u8; 32],
+    shards: &[Vec<u8>],
+) -> usize {
+    let mut peers = 0;
+    for (index, data) in shards.iter().enumerate() {
+        let topic = column_topic(index).hash();
+        let message = ColumnShardMessage {
+            index: index as u16,
+            payload_len: payload_len as u64,
+            shard_len: shard_len as u64,
+            payload_hash,
+            data: data.clone(),
+        };
+        let message_id = content_message_id_for(&topic, &message.encode());
+        peers += swarm
+            .behaviour_mut()
+            .gossipsub
+            .send_idontwant_to_mesh(topic, [message_id]);
+    }
+    peers
+}
+
 fn handle_rs_subnets(
     swarm: &mut Swarm<SimBehaviour>,
     state: &mut RsSubnetState,
@@ -599,8 +625,20 @@ fn handle_rs_subnets(
         .filter_map(|(i, s)| s.clone().map(|d| (i, d)))
         .collect();
     match decode_payload(payload_len, shard_len, &hash, &present) {
-        Ok((payload, _)) => {
+        Ok((payload, full_shards)) => {
             state.chunks_reconstructed = true;
+            let idontwant_peers = send_reconstructed_chunk_idontwants(
+                swarm,
+                payload_len,
+                shard_len,
+                hash,
+                &full_shards,
+            );
+            event!(
+                "reconstructed_chunk_idontwant_sent",
+                chunks = full_shards.len(),
+                peers = idontwant_peers
+            );
             mark_reconstructed(reconstructed, &payload);
             if state.bridge_payload && gossipsub_publish_payload(swarm, &payload) {
                 event!(
@@ -1080,5 +1118,40 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(payload_hash(&a).len(), 64);
+    }
+
+    #[test]
+    fn reconstructed_chunk_message_ids_match_published_chunks() {
+        let payload = make_payload(42, 1024);
+        let (shard_len, hash, shards) = encode_payload_shards(&payload).unwrap();
+        let initial: Vec<_> = shards
+            .iter()
+            .take(PAYLOAD_DATA_SHARDS)
+            .cloned()
+            .enumerate()
+            .collect();
+        let (_, reconstructed_shards) =
+            decode_payload(payload.len(), shard_len, &hash, &initial).unwrap();
+
+        for (index, (published, reconstructed)) in
+            shards.iter().zip(reconstructed_shards.iter()).enumerate()
+        {
+            let topic = column_topic(index).hash();
+            let published = ColumnShardMessage {
+                index: index as u16,
+                payload_len: payload.len() as u64,
+                shard_len: shard_len as u64,
+                payload_hash: hash,
+                data: published.clone(),
+            };
+            let reconstructed = ColumnShardMessage {
+                data: reconstructed.clone(),
+                ..published.clone()
+            };
+            assert_eq!(
+                content_message_id_for(&topic, &published.encode()),
+                content_message_id_for(&topic, &reconstructed.encode())
+            );
+        }
     }
 }

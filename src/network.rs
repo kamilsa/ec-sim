@@ -170,13 +170,20 @@ fn configure_topic_mesh(
         .mesh_outbound_min_for_topic(tuning.mesh_outbound_min, topic);
 }
 
-fn content_message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
-    let topic = message.topic.as_str().as_bytes();
+pub(crate) fn content_message_id_for(
+    topic: &gossipsub::TopicHash,
+    data: &[u8],
+) -> gossipsub::MessageId {
+    let topic = topic.as_str().as_bytes();
     let mut hasher = Sha256::new();
     hasher.update((topic.len() as u64).to_le_bytes());
     hasher.update(topic);
-    hasher.update(&message.data);
+    hasher.update(data);
     gossipsub::MessageId::from(hasher.finalize().to_vec())
+}
+
+fn content_message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
+    content_message_id_for(&message.topic, &message.data)
 }
 
 fn gossipsub_config(tuning: &GossipTuning) -> gossipsub::Config {

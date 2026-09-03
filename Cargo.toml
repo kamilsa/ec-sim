@@ -12,7 +12,7 @@ path = "src/main.rs"
 # messages + per-topic `traffic()` byte counters). See blobsim's Cargo.toml
 # for the patch list on `blobsim-patches`.
 [dependencies]
-libp2p = { git = "https://github.com/kamilsa/rust-libp2p", rev = "f5f21b73ae24cc22a81eda87c1afb421ea02a178", features = [
+libp2p = { git = "https://github.com/kamilsa/rust-libp2p", rev = "2473afce1b3e05393f86aabdcdf57aa4ab1d6c2e", features = [
     "gossipsub",
     "gossipsub-partial-messages",
     "quic",
