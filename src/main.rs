@@ -370,6 +370,10 @@ fn handle_rs_partial(
             added = outcome.added_shards,
             distinct = outcome.distinct_shards
         );
+    }
+    if outcome.added_shards > 0 || outcome.learned_header {
+        // A header-only first contact must advertise its missing shards so the
+        // relay can answer the partial-message protocol's request handshake.
         republish_rs_partial(swarm, state, payload_hash);
     }
     if outcome.crossed_threshold {

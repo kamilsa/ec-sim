@@ -641,6 +641,9 @@ struct PayloadAssembly {
 /// Outcome of merging one received set of shards into the assembler.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeOutcome {
+    /// A header was learned for this payload for the first time. This lets a
+    /// header-only recipient publish its missing-shard request to the sender.
+    pub learned_header: bool,
     /// Genuinely new distinct shards this merge added.
     pub added_shards: usize,
     /// Total distinct shards held after this merge.
@@ -740,6 +743,7 @@ impl PayloadChunkAssembler {
         if !chunks.is_structurally_valid() {
             return MergeOutcome::default();
         }
+        let learned_header = chunks.header.is_some() && self.get_header(&payload_hash).is_none();
         if let Some(header) = &chunks.header {
             self.set_header(payload_hash, header.clone());
         }
@@ -770,6 +774,7 @@ impl PayloadChunkAssembler {
             assembly.state = PayloadState::Reconstructing;
         }
         MergeOutcome {
+            learned_header,
             added_shards: added,
             distinct_shards: distinct,
             crossed_threshold: crossed,
@@ -985,6 +990,22 @@ mod tests {
         let second = assembler.merge_partial(hash, &body);
         assert_eq!(second.added_shards, 0);
         assert!(!second.crossed_threshold);
+    }
+
+    #[test]
+    fn first_header_only_message_requests_a_republish() {
+        let hash = [6u8; 32];
+        let body = PartialPayloadChunks::empty(Some(header(100, 2, hash)));
+        let mut assembler = PayloadChunkAssembler::new(4);
+
+        let first = assembler.merge_partial(hash, &body);
+        assert!(first.learned_header);
+        assert_eq!(first.added_shards, 0);
+        assert_eq!(first.distinct_shards, 0);
+
+        let duplicate = assembler.merge_partial(hash, &body);
+        assert!(!duplicate.learned_header);
+        assert_eq!(duplicate.added_shards, 0);
     }
 
     #[test]
