@@ -26,8 +26,8 @@ to compare time-to-N% reach and bytes sent.
 uv run shadow-sim.py                 # build (if needed) + run with ecsim.toml
 uv run shadow-sim.py --dry-run       # generate shadow.yaml / topology.gml only
 uv run shadow-sim.py --rebuild       # force docker build first
-uv run shadow-sim.py --clean         # wipe previous shadow.data/
-uv run shadow-sim.py --serve         # run, then print a summary and serve Plotly HTML
+uv run shadow-sim.py --clean         # wipe shadow.data/, run history, and summary.html
+uv run shadow-sim.py --serve         # run, snapshot history, serve interactive HTML
 uv run shadow-sim.py --serve-only --overlay other-output
 ```
 
@@ -41,6 +41,13 @@ Each node emits structured `EVENT kind=... t_ms=...` lines on Shadow's shared
 realtime clock (`warmup_complete`, `payload_published`, `payload_received`,
 `payload_reconstructed`, `bytes`, `run_end`).
 
-`--serve` prints time-to-50/90/99% reconstruction, a bytes summary, and serves a
-self-contained Plotly HTML at http://0.0.0.0:4321/summary.html. Pass extra output
-directories with `--overlay` to color-compare modes.
+Every successful run is appended to `<output.dir>/runs-history.json` and the
+self-contained `summary.html` is rewritten from that history. Click a table row
+to select a run and see its reconstruction CDF; pick a node to see that node's
+sent and received bytes. `--clean` wipes the history table so a new campaign
+starts empty. `--overlay DIR` imports extra output dirs into the same history
+(skipped if that dir + seed + `run_index` is already recorded).
+
+`--serve` prints time-to-50/95/99% reconstruction, a bytes summary, and serves
+the page at http://0.0.0.0:4321/summary.html. `--serve-only` rebuilds HTML from
+existing history without duplicating the current dir.

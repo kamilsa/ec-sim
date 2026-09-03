@@ -8,13 +8,11 @@ dependencies = []
 [project.optional-dependencies]
 analyze = [
     "plotly>=5.0",
-    "pandas>=2.0",
 ]
 
 [dependency-groups]
 analyze = [
     "plotly>=5.0",
-    "pandas>=2.0",
 ]
 
 [tool.uv]

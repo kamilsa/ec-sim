@@ -18,7 +18,7 @@ Usage:
   uv run shadow-sim.py my.toml              # use a different config file
   uv run shadow-sim.py --dry-run            # generate shadow.yaml/topology.gml only
   uv run shadow-sim.py --rebuild            # force `docker build` first
-  uv run shadow-sim.py my.toml --clean      # remove previous shadow.data/ first
+  uv run shadow-sim.py my.toml --clean      # wipe shadow.data/, history, and summary.html
 
 Results land in `<output.dir>/shadow.data/hosts/<host>/ec-sim.1000.stdout`.
 """
@@ -525,7 +525,8 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int,
     return n
 
 
-def analyze_and_serve(out_dir: Path, overlays: list[Path], serve: bool) -> None:
+def analyze_and_serve(out_dir: Path, overlays: list[Path], serve: bool,
+                      append: bool = False) -> None:
     script = REPO_ROOT / "scripts" / "analyze.py"
     if not script.is_file():
         log("scripts/analyze.py not found — skipping analysis")
@@ -534,6 +535,8 @@ def analyze_and_serve(out_dir: Path, overlays: list[Path], serve: bool) -> None:
     cmd = ["uv", "run", "--group", "analyze", "python3", str(script)]
     if serve:
         cmd.append("--serve")
+    if append:
+        cmd.append("--append")
     cmd += [str(d) for d in dirs]
     log("writing CLI summary + Plotly HTML…")
     subprocess.run(cmd, cwd=str(REPO_ROOT), check=False)
@@ -547,17 +550,17 @@ def main() -> None:
                     help="generate shadow.yaml + topology.gml only; no build or run")
     ap.add_argument("--rebuild", action="store_true", help="force `docker build` first")
     ap.add_argument("--clean", action="store_true",
-                    help="remove previous shadow.data/ before running")
+                    help="remove previous shadow.data/, runs-history.json, and summary.html")
     ap.add_argument("--summary-only", action="store_true",
                     help="skip generation/build/run; just summarize an existing run")
     ap.add_argument("--serve", "-s", action="store_true",
-                    help="after the run, print a CLI summary, write Plotly HTML, "
-                         "and serve it at http://0.0.0.0:4321 until Ctrl+C")
+                    help="after the run, serve the interactive summary HTML "
+                         "at http://0.0.0.0:4321 until Ctrl+C")
     ap.add_argument("--serve-only", action="store_true",
-                    help="skip the simulation; summarize + serve existing output dirs")
+                    help="skip the simulation; rebuild HTML from history and serve")
     ap.add_argument("--overlay", action="append", default=[], metavar="DIR",
-                    help="extra output dir to overlay by mode when serving "
-                         "(repeatable)")
+                    help="extra output dir to import into the run history "
+                         "(repeatable; skipped if already recorded)")
     args = ap.parse_args()
 
     cfg_path = Path(args.config)
@@ -601,6 +604,13 @@ def main() -> None:
     if args.clean:
         shutil.rmtree(out_dir / "shadow.data", ignore_errors=True)
         log(f"cleaned {out_dir / 'shadow.data'}")
+        for name in ("runs-history.json", "summary.html"):
+            path = out_dir / name
+            try:
+                path.unlink()
+                log(f"cleaned {path}")
+            except FileNotFoundError:
+                pass
 
     base_seed = int(cfg["sim"]["seed"])
     runs = max(1, int(cfg["sim"].get("runs", 1)))
@@ -654,6 +664,7 @@ def main() -> None:
              "mesh_outbound_min": mesh_outbound},
             indent=2))
         summarize(out_dir)
+        analyze_and_serve(out_dir, overlays, serve=False, append=True)
 
     if args.dry_run:
         return
@@ -661,7 +672,7 @@ def main() -> None:
     log("done. Results under:")
     log(f"  {out_dir}/shadow.data/hosts/<host>/ec-sim.1000.stdout")
     if args.serve:
-        analyze_and_serve(out_dir, overlays, serve=True)
+        analyze_and_serve(out_dir, overlays, serve=True, append=False)
     else:
         log(f"Analyse with:  uv run --group analyze python {REPO_ROOT}/scripts/analyze.py {out_dir}")
 
