@@ -12,7 +12,7 @@
 runner = "docker"
 
 [sim]
-mode = "hybrid"           # gossipsub | rs-partial | rs-subnets | hybrid | rlnc
+mode = "gossipsub"           # gossipsub | rs-partial | rs-subnets | hybrid | rlnc
 seed = 42                     # master RNG seed (topology + per-node keypairs)
 runs = 1                      # number of runs; run i uses seed+i
 payload_size_kib = 256        # payload the builder publishes once after warmup
@@ -41,18 +41,21 @@ gossip_factor = 0.00
 #   and 2 * <profile>_mesh_outbound_min <= <profile>_mesh_n
 # The execution and partial topics are broadly subscribed; column subnets are
 # subscribed only by hybrid nodes, so they use a smaller mesh.
-execution_mesh_n_low = 60
-execution_mesh_n = 80
-execution_mesh_n_high = 90
-execution_mesh_outbound_min = 18
+execution_mesh_n_low = 4
+execution_mesh_n = 8
+execution_mesh_n_high = 12
+execution_mesh_outbound_min = 3
+
 partial_mesh_n_low = 60
 partial_mesh_n = 80
 partial_mesh_n_high = 90
 partial_mesh_outbound_min = 18
-subnet_mesh_n_low = 4
-subnet_mesh_n = 8
-subnet_mesh_n_high = 12
-subnet_mesh_outbound_min = 2
+
+subnet_mesh_n_low = 1
+subnet_mesh_n = 3
+subnet_mesh_n_high = 5
+subnet_mesh_outbound_min = 1
+
 rust_log = "info"
 # stop_time = "90s"           # optional; default = warmup_secs + observe_secs + 60s
 

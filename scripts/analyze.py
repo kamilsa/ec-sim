@@ -625,12 +625,15 @@ def serve(html_path: Path, port: int = SERVE_PORT) -> None:
             sys.stderr.write("[analyze] " + (fmt % args) + "\n")
 
     httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    httpd.daemon_threads = True
     print(f"serving {html_path.name} at http://0.0.0.0:{port}/{html_path.name}")
     print("press Ctrl+C to stop.")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print()
+    finally:
+        httpd.server_close()
 
 
 FIXTURE_EVENTS = """
