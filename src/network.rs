@@ -45,8 +45,8 @@ pub fn column_from_topic(topic: &str) -> Option<usize> {
 
 /// The composed libp2p behaviour for the simulator.
 ///
-/// Modes 1–3 use `gossipsub` only. Mode 4 uses the RLNC push protocol on the
-/// same QUIC connections.
+/// Gossipsub modes, including hybrid payload-and-subnet propagation, share the
+/// same swarm. RLNC uses its push protocol on the same QUIC connections.
 #[derive(NetworkBehaviour)]
 pub struct SimBehaviour {
     pub gossipsub: gossipsub::Behaviour,
@@ -67,7 +67,31 @@ pub fn keypair_from_seed(seed: u64) -> identity::Keypair {
     identity::Keypair::ed25519_from_bytes(secret).expect("valid ed25519 key from seed")
 }
 
-/// Gossipsub fan-out tuning.
+/// Mesh degrees for one class of gossipsub topics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshTuning {
+    /// Target mesh size (`D`).
+    pub mesh_n: usize,
+    /// Mesh low-water mark (`D_low`): below this the mesh is topped up.
+    pub mesh_n_low: usize,
+    /// Mesh high-water mark (`D_high`): above this the mesh is trimmed.
+    pub mesh_n_high: usize,
+    /// Minimum number of outbound peers to keep in the mesh.
+    pub mesh_outbound_min: usize,
+}
+
+impl Default for MeshTuning {
+    fn default() -> Self {
+        Self {
+            mesh_n: 8,
+            mesh_n_low: 6,
+            mesh_n_high: 12,
+            mesh_outbound_min: 2,
+        }
+    }
+}
+
+/// Gossipsub fan-out and per-topic mesh tuning.
 ///
 /// Surfaced as configuration because the libp2p defaults differ from what
 /// Ethereum clients run (`flood_publish = false`, mesh D=8).
@@ -79,14 +103,12 @@ pub struct GossipTuning {
     pub gossip_lazy: usize,
     /// Fraction of non-mesh peers to gossip to.
     pub gossip_factor: f64,
-    /// Target mesh size (`D`).
-    pub mesh_n: usize,
-    /// Mesh low-water mark (`D_low`): below this the mesh is topped up.
-    pub mesh_n_low: usize,
-    /// Mesh high-water mark (`D_high`): above this the mesh is trimmed.
-    pub mesh_n_high: usize,
-    /// Minimum number of outbound peers to keep in the mesh.
-    pub mesh_outbound_min: usize,
+    /// Mesh degrees for the full execution payload topic.
+    pub execution: MeshTuning,
+    /// Mesh degrees for every RS column subnet topic.
+    pub subnet: MeshTuning,
+    /// Mesh degrees for the RS partial-message topic.
+    pub partial: MeshTuning,
 }
 
 impl Default for GossipTuning {
@@ -95,10 +117,9 @@ impl Default for GossipTuning {
             flood_publish: false,
             gossip_lazy: 0,
             gossip_factor: 0.0,
-            mesh_n: 8,
-            mesh_n_low: 6,
-            mesh_n_high: 12,
-            mesh_outbound_min: 2,
+            execution: MeshTuning::default(),
+            subnet: MeshTuning::default(),
+            partial: MeshTuning::default(),
         }
     }
 }
@@ -106,13 +127,13 @@ impl Default for GossipTuning {
 impl GossipTuning {
     /// Check the mesh inequalities gossipsub documents, for one
     /// `(outbound_min, n_low, n, n_high)` tuple.
-    fn validate_mesh_tuple(
-        outbound_min: usize,
-        n_low: usize,
-        n: usize,
-        n_high: usize,
-        label: &str,
-    ) -> Result<(), String> {
+    fn validate_mesh_tuple(mesh: MeshTuning, label: &str) -> Result<(), String> {
+        let MeshTuning {
+            mesh_outbound_min: outbound_min,
+            mesh_n_low: n_low,
+            mesh_n: n,
+            mesh_n_high: n_high,
+        } = mesh;
         if !(outbound_min <= n_low && n_low <= n && n <= n_high) {
             return Err(format!(
                 "{label} mesh parameters must satisfy \
@@ -128,20 +149,48 @@ impl GossipTuning {
         Ok(())
     }
 
-    /// Check the mesh inequalities gossipsub documents.
-    ///
-    /// These are *not* enforced by `ConfigBuilder::build()` for a global mesh
-    /// config, so an invalid combination would build cleanly and then misbehave
-    /// at runtime.
+    /// Check the mesh inequalities gossipsub documents for every topic class.
     pub fn validate(&self) -> Result<(), String> {
-        Self::validate_mesh_tuple(
-            self.mesh_outbound_min,
-            self.mesh_n_low,
-            self.mesh_n,
-            self.mesh_n_high,
-            "gossipsub",
-        )
+        Self::validate_mesh_tuple(self.execution, "execution")?;
+        Self::validate_mesh_tuple(self.subnet, "subnet")?;
+        Self::validate_mesh_tuple(self.partial, "partial")
     }
+}
+
+fn configure_topic_mesh(
+    builder: &mut gossipsub::ConfigBuilder,
+    topic: gossipsub::TopicHash,
+    tuning: MeshTuning,
+) {
+    builder
+        .mesh_n_for_topic(tuning.mesh_n, topic.clone())
+        .mesh_n_low_for_topic(tuning.mesh_n_low, topic.clone())
+        .mesh_n_high_for_topic(tuning.mesh_n_high, topic.clone())
+        .mesh_outbound_min_for_topic(tuning.mesh_outbound_min, topic);
+}
+
+fn gossipsub_config(tuning: &GossipTuning) -> gossipsub::Config {
+    let mut builder = gossipsub::ConfigBuilder::default();
+    builder
+        .heartbeat_interval(Duration::from_millis(700))
+        // Use the execution mesh as the fallback for unexpected topics.
+        .mesh_n_low(tuning.execution.mesh_n_low)
+        .mesh_n(tuning.execution.mesh_n)
+        .mesh_n_high(tuning.execution.mesh_n_high)
+        .mesh_outbound_min(tuning.execution.mesh_outbound_min)
+        .flood_publish(tuning.flood_publish)
+        .gossip_lazy(tuning.gossip_lazy)
+        .gossip_factor(tuning.gossip_factor)
+        .history_length(5)
+        .history_gossip(3)
+        .max_transmit_size(16 * 1024 * 1024)
+        .validation_mode(gossipsub::ValidationMode::Permissive);
+    configure_topic_mesh(&mut builder, payload_topic().hash(), tuning.execution);
+    configure_topic_mesh(&mut builder, payload_chunk_topic().hash(), tuning.partial);
+    for column in 0..NUM_COLUMNS {
+        configure_topic_mesh(&mut builder, column_topic(column).hash(), tuning.subnet);
+    }
+    builder.build().expect("valid gossipsub config")
 }
 
 /// Build and configure the libp2p swarm.
@@ -156,21 +205,7 @@ pub fn build_swarm(
     let local_peer_id = PeerId::from(keypair.public());
     info!(%local_peer_id, "building swarm");
 
-    let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(Duration::from_millis(700))
-        .mesh_n_low(tuning.mesh_n_low)
-        .mesh_n(tuning.mesh_n)
-        .mesh_n_high(tuning.mesh_n_high)
-        .mesh_outbound_min(tuning.mesh_outbound_min)
-        .flood_publish(tuning.flood_publish)
-        .gossip_lazy(tuning.gossip_lazy)
-        .gossip_factor(tuning.gossip_factor)
-        .history_length(5)
-        .history_gossip(3)
-        .max_transmit_size(16 * 1024 * 1024)
-        .validation_mode(gossipsub::ValidationMode::Permissive)
-        .build()
-        .expect("valid gossipsub config");
+    let gossipsub_config = gossipsub_config(tuning);
 
     let gossipsub = gossipsub::Behaviour::new(
         MessageAuthenticity::Signed(keypair.clone()),
@@ -266,19 +301,28 @@ mod tests {
     #[test]
     fn ordering_violations_are_rejected() {
         let low_above_n = GossipTuning {
-            mesh_n_low: 9,
+            execution: MeshTuning {
+                mesh_n_low: 9,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(low_above_n.validate().is_err());
 
         let n_above_high = GossipTuning {
-            mesh_n: 20,
+            subnet: MeshTuning {
+                mesh_n: 20,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(n_above_high.validate().is_err());
 
         let outbound_above_low = GossipTuning {
-            mesh_outbound_min: 7,
+            partial: MeshTuning {
+                mesh_outbound_min: 7,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(outbound_above_low.validate().is_err());
@@ -287,10 +331,12 @@ mod tests {
     #[test]
     fn outbound_min_cannot_exceed_half_the_mesh() {
         let tuning = GossipTuning {
-            mesh_outbound_min: 2,
-            mesh_n_low: 3,
-            mesh_n: 3,
-            mesh_n_high: 4,
+            subnet: MeshTuning {
+                mesh_outbound_min: 2,
+                mesh_n_low: 3,
+                mesh_n: 3,
+                mesh_n_high: 4,
+            },
             ..Default::default()
         };
         let err = tuning.validate().expect_err("2 * 2 > 3 must be rejected");
@@ -300,13 +346,57 @@ mod tests {
     #[test]
     fn lighthouse_low_load_tier_is_expressible() {
         let tuning = GossipTuning {
-            mesh_outbound_min: 1,
-            mesh_n_low: 1,
-            mesh_n: 3,
-            mesh_n_high: 4,
+            partial: MeshTuning {
+                mesh_outbound_min: 1,
+                mesh_n_low: 1,
+                mesh_n: 3,
+                mesh_n_high: 4,
+            },
             ..Default::default()
         };
         assert!(tuning.validate().is_ok(), "{:?}", tuning.validate());
+    }
+
+    #[test]
+    fn topic_classes_receive_independent_mesh_profiles() {
+        let tuning = GossipTuning {
+            execution: MeshTuning {
+                mesh_n: 80,
+                mesh_n_low: 60,
+                mesh_n_high: 90,
+                mesh_outbound_min: 18,
+            },
+            subnet: MeshTuning {
+                mesh_n: 8,
+                mesh_n_low: 4,
+                mesh_n_high: 12,
+                mesh_outbound_min: 2,
+            },
+            partial: MeshTuning {
+                mesh_n: 40,
+                mesh_n_low: 30,
+                mesh_n_high: 50,
+                mesh_outbound_min: 10,
+            },
+            ..Default::default()
+        };
+        let config = gossipsub_config(&tuning);
+
+        for (topic, expected) in [
+            (payload_topic(), tuning.execution),
+            (payload_chunk_topic(), tuning.partial),
+            (column_topic(0), tuning.subnet),
+            (column_topic(NUM_COLUMNS - 1), tuning.subnet),
+        ] {
+            let hash = topic.hash();
+            assert_eq!(config.mesh_n_for_topic(&hash), expected.mesh_n);
+            assert_eq!(config.mesh_n_low_for_topic(&hash), expected.mesh_n_low);
+            assert_eq!(config.mesh_n_high_for_topic(&hash), expected.mesh_n_high);
+            assert_eq!(
+                config.mesh_outbound_min_for_topic(&hash),
+                expected.mesh_outbound_min
+            );
+        }
     }
 
     #[test]
@@ -318,5 +408,10 @@ mod tests {
         assert_eq!(column_from_topic("/ec/payload_column/128/1"), None);
         assert_eq!(column_from_topic("/ec/payload/1"), None);
         assert_eq!(column_from_topic("/ec/payload_column/7"), None);
+    }
+
+    #[test]
+    fn every_payload_shard_has_a_column_topic() {
+        assert_eq!(NUM_COLUMNS, crate::coding::PAYLOAD_TOTAL_SHARDS);
     }
 }

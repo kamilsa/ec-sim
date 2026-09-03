@@ -12,7 +12,7 @@
 runner = "docker"
 
 [sim]
-mode = "rs-partial"           # gossipsub | rs-partial | rs-subnets | rlnc
+mode = "hybrid"           # gossipsub | rs-partial | rs-subnets | hybrid | rlnc
 seed = 42                     # master RNG seed (topology + per-node keypairs)
 runs = 1                      # number of runs; run i uses seed+i
 payload_size_kib = 256        # payload the builder publishes once after warmup
@@ -22,7 +22,13 @@ observe_secs = 20             # window after publish before every node exits
 # 60/80/90 with 18 outbound peers. Validated at 128/128 reconstructed, t95=856 ms.
 payload_chunk_recipients = 3  # rs-partial: mesh peers seeded per shard
 rlnc_chunks = 10              # RLNC source-packet count N
-rlnc_fanout = 40              # RLNC push degree D (independent of mesh_n)
+rlnc_fanout = 40              # RLNC push degree D (independent of gossipsub meshes)
+# hybrid: every node receives full payload gossip; selected nodes also receive
+# all RS column subnets and re-gossip a chunk-reconstructed payload. "fraction"
+# selects a seeded random subset (including the builder); "supernodes" selects
+# all supernodes plus the builder. The selection must include at least 2 nodes.
+hybrid_selection = "supernodes" # fraction | supernodes
+hybrid_rs_subnet_fraction = 0.25
 
 # Gossipsub fan-out. libp2p defaults flood_publish to true; Ethereum clients set
 # false. Zero lazy gossip so amplification does not dominate the comparison.
@@ -30,17 +36,28 @@ flood_publish = false
 gossip_lazy = 0
 gossip_factor = 0.00
 
-# Mesh sizing. Must satisfy:
-#   mesh_outbound_min <= mesh_n_low <= mesh_n <= mesh_n_high   and   2*mesh_outbound_min <= mesh_n
-mesh_n_low = 60
-mesh_n = 80
-mesh_n_high = 90
-mesh_outbound_min = 18
+# Per-topic mesh sizing. Every profile must satisfy:
+#   <profile>_mesh_outbound_min <= <profile>_mesh_n_low <= <profile>_mesh_n <= <profile>_mesh_n_high
+#   and 2 * <profile>_mesh_outbound_min <= <profile>_mesh_n
+# The execution and partial topics are broadly subscribed; column subnets are
+# subscribed only by hybrid nodes, so they use a smaller mesh.
+execution_mesh_n_low = 60
+execution_mesh_n = 80
+execution_mesh_n_high = 90
+execution_mesh_outbound_min = 18
+partial_mesh_n_low = 60
+partial_mesh_n = 80
+partial_mesh_n_high = 90
+partial_mesh_outbound_min = 18
+subnet_mesh_n_low = 4
+subnet_mesh_n = 8
+subnet_mesh_n_high = 12
+subnet_mesh_outbound_min = 2
 rust_log = "info"
 # stop_time = "90s"           # optional; default = warmup_secs + observe_secs + 60s
 
 [topology]
-nodes = 128                   # including the builder (node 0)
+nodes = 512                   # including the builder (node 0)
 peers_per_node = 50           # random QUIC peers each node dials
 
 # Geo-realistic network. A seeded fraction of hosts are supernodes with 1 Gbit

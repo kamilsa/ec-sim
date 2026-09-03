@@ -1,8 +1,8 @@
 //! Payload-propagation simulator — Shadow-compatible entry point.
 //!
-//! One homogeneous network, one protocol per run. Connections warm up, the
-//! builder publishes a single payload, every node observes for a window, then
-//! exits.
+//! Connections warm up, the builder publishes a single payload, every node
+//! observes for a window, then exits. Hybrid runs additionally select nodes
+//! that receive RS shards and bridge reconstructed payloads back to gossipsub.
 
 #[macro_use]
 mod events;
@@ -19,7 +19,7 @@ use crate::coding::{
 use crate::events::hex_bytes;
 use crate::network::{
     build_swarm, column_from_topic, column_topic, dial_peers, gossip_byte_totals, keypair_from_seed,
-    mesh_peer_count, payload_chunk_topic, payload_topic, subscribe_partial, GossipTuning,
+    mesh_peer_count, payload_chunk_topic, payload_topic, subscribe_partial, GossipTuning, MeshTuning,
     SimBehaviour, SimBehaviourEvent, NUM_COLUMNS,
 };
 use crate::payload_chunks::{
@@ -41,7 +41,7 @@ use tokio::time::{self, Duration, Instant};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// Propagation protocol selected for this run. Every peer speaks the same one.
+/// Propagation protocol selected for this node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum Mode {
     #[default]
@@ -50,6 +50,7 @@ enum Mode {
     RsPartial,
     #[value(name = "rs-subnets")]
     RsSubnets,
+    Hybrid,
     Rlnc,
 }
 
@@ -59,6 +60,7 @@ impl std::fmt::Display for Mode {
             Mode::Gossipsub => "gossipsub",
             Mode::RsPartial => "rs-partial",
             Mode::RsSubnets => "rs-subnets",
+            Mode::Hybrid => "hybrid",
             Mode::Rlnc => "rlnc",
         })
     }
@@ -68,13 +70,17 @@ impl std::fmt::Display for Mode {
 #[derive(Parser, Debug)]
 #[command(name = "ec-sim", version, about)]
 struct Cli {
-    /// Propagation mode. Every peer in the run speaks this protocol.
+    /// Propagation mode for this node.
     #[arg(long, value_enum, default_value_t = Mode::Gossipsub)]
     mode: Mode,
 
     /// This node is the builder (publishes the payload once after warmup).
     #[arg(long, default_value_t = false)]
     builder: bool,
+
+    /// Subscribe to all RS column subnets in hybrid mode.
+    #[arg(long, default_value_t = false)]
+    rs_subnet_subscriber: bool,
 
     /// Deterministic RNG seed (launcher sets sim.seed + node index).
     #[arg(long, default_value_t = 42)]
@@ -133,21 +139,53 @@ struct Cli {
     #[arg(long, default_value_t = 0.0)]
     gossip_factor: f64,
 
-    /// Target mesh size (`D`).
+    /// Execution payload mesh target size (`D`).
     #[arg(long, default_value_t = 8)]
-    mesh_n: usize,
+    execution_mesh_n: usize,
 
-    /// Mesh low-water mark (`D_low`).
+    /// Execution payload mesh low-water mark (`D_low`).
     #[arg(long, default_value_t = 6)]
-    mesh_n_low: usize,
+    execution_mesh_n_low: usize,
 
-    /// Mesh high-water mark (`D_high`).
+    /// Execution payload mesh high-water mark (`D_high`).
     #[arg(long, default_value_t = 12)]
-    mesh_n_high: usize,
+    execution_mesh_n_high: usize,
 
-    /// Minimum number of outbound peers to keep in the mesh.
+    /// Execution payload mesh minimum outbound peers (`D_out`).
     #[arg(long, default_value_t = 2)]
-    mesh_outbound_min: usize,
+    execution_mesh_outbound_min: usize,
+
+    /// Column subnet mesh target size (`D`).
+    #[arg(long, default_value_t = 8)]
+    subnet_mesh_n: usize,
+
+    /// Column subnet mesh low-water mark (`D_low`).
+    #[arg(long, default_value_t = 6)]
+    subnet_mesh_n_low: usize,
+
+    /// Column subnet mesh high-water mark (`D_high`).
+    #[arg(long, default_value_t = 12)]
+    subnet_mesh_n_high: usize,
+
+    /// Column subnet mesh minimum outbound peers (`D_out`).
+    #[arg(long, default_value_t = 2)]
+    subnet_mesh_outbound_min: usize,
+
+    /// Partial-message mesh target size (`D`).
+    #[arg(long, default_value_t = 8)]
+    partial_mesh_n: usize,
+
+    /// Partial-message mesh low-water mark (`D_low`).
+    #[arg(long, default_value_t = 6)]
+    partial_mesh_n_low: usize,
+
+    /// Partial-message mesh high-water mark (`D_high`).
+    #[arg(long, default_value_t = 12)]
+    partial_mesh_n_high: usize,
+
+    /// Partial-message mesh minimum outbound peers (`D_out`).
+    #[arg(long, default_value_t = 2)]
+    partial_mesh_outbound_min: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,10 +206,24 @@ fn gossip_tuning(cli: &Cli) -> GossipTuning {
         flood_publish: cli.flood_publish,
         gossip_lazy: cli.gossip_lazy,
         gossip_factor: cli.gossip_factor,
-        mesh_n: cli.mesh_n,
-        mesh_n_low: cli.mesh_n_low,
-        mesh_n_high: cli.mesh_n_high,
-        mesh_outbound_min: cli.mesh_outbound_min,
+        execution: MeshTuning {
+            mesh_n: cli.execution_mesh_n,
+            mesh_n_low: cli.execution_mesh_n_low,
+            mesh_n_high: cli.execution_mesh_n_high,
+            mesh_outbound_min: cli.execution_mesh_outbound_min,
+        },
+        subnet: MeshTuning {
+            mesh_n: cli.subnet_mesh_n,
+            mesh_n_low: cli.subnet_mesh_n_low,
+            mesh_n_high: cli.subnet_mesh_n_high,
+            mesh_outbound_min: cli.subnet_mesh_outbound_min,
+        },
+        partial: MeshTuning {
+            mesh_n: cli.partial_mesh_n,
+            mesh_n_low: cli.partial_mesh_n_low,
+            mesh_n_high: cli.partial_mesh_n_high,
+            mesh_outbound_min: cli.partial_mesh_outbound_min,
+        },
     }
 }
 
@@ -196,7 +248,20 @@ fn mesh_topic(mode: Mode) -> libp2p::gossipsub::IdentTopic {
     match mode {
         Mode::RsPartial => payload_chunk_topic(),
         Mode::RsSubnets => column_topic(0),
+        Mode::Hybrid => payload_topic(),
         _ => payload_topic(),
+    }
+}
+
+fn chunk_subscriber(mode: Mode, rs_subnet_subscriber: bool) -> bool {
+    mode == Mode::RsSubnets || (mode == Mode::Hybrid && rs_subnet_subscriber)
+}
+
+fn primary_mesh_tuning(mode: Mode, tuning: &GossipTuning) -> MeshTuning {
+    match mode {
+        Mode::RsPartial => tuning.partial,
+        Mode::RsSubnets => tuning.subnet,
+        _ => tuning.execution,
     }
 }
 
@@ -206,13 +271,18 @@ fn warmup_ready(swarm: &Swarm<SimBehaviour>, cli: &Cli, tuning: &GossipTuning) -
         return true;
     }
     let connected = swarm.connected_peers().count();
-    let conn_ok = connected >= dial_count.min(tuning.mesh_n.max(1));
+    let primary_mesh = primary_mesh_tuning(cli.mode, tuning);
+    let conn_ok = connected >= dial_count.min(primary_mesh.mesh_n.max(1));
     if cli.mode == Mode::Rlnc {
         return conn_ok;
     }
     let mesh = mesh_peer_count(swarm, &mesh_topic(cli.mode));
-    let mesh_ok = mesh >= tuning.mesh_n_low.min(connected.max(1));
-    conn_ok && mesh_ok
+    let mesh_ok = mesh >= primary_mesh.mesh_n_low.min(connected.max(1));
+    let subnet_mesh_ok = !(cli.mode == Mode::Hybrid
+        && cli.builder
+        && chunk_subscriber(cli.mode, cli.rs_subnet_subscriber))
+        || mesh_peer_count(swarm, &column_topic(0)) >= 1;
+    conn_ok && mesh_ok && subnet_mesh_ok
 }
 
 fn mark_reconstructed(reconstructed: &mut bool, payload: &[u8]) {
@@ -233,20 +303,27 @@ fn mark_reconstructed(reconstructed: &mut bool, payload: &[u8]) {
     );
 }
 
-fn publish_gossipsub(swarm: &mut Swarm<SimBehaviour>, payload: &[u8]) {
+fn gossipsub_publish_payload(swarm: &mut Swarm<SimBehaviour>, payload: &[u8]) -> bool {
     match swarm
         .behaviour_mut()
         .gossipsub
         .publish(payload_topic(), payload.to_vec())
     {
-        Ok(_) => {
-            event!(
-                "payload_published",
-                bytes = payload.len(),
-                hash = payload_hash(payload)
-            );
+        Ok(_) => true,
+        Err(err) => {
+            warn!(%err, "gossipsub publish failed");
+            false
         }
-        Err(err) => warn!(%err, "gossipsub publish failed"),
+    }
+}
+
+fn publish_gossipsub(swarm: &mut Swarm<SimBehaviour>, payload: &[u8]) {
+    if gossipsub_publish_payload(swarm, payload) {
+        event!(
+            "payload_published",
+            bytes = payload.len(),
+            hash = payload_hash(payload)
+        );
     }
 }
 
@@ -391,15 +468,19 @@ struct RsSubnetState {
     payload_len: Option<usize>,
     shard_len: Option<usize>,
     payload_hash: Option<[u8; 32]>,
+    bridge_payload: bool,
+    chunks_reconstructed: bool,
 }
 
 impl RsSubnetState {
-    fn new() -> Self {
+    fn new(bridge_payload: bool) -> Self {
         Self {
             shards: vec![None; PAYLOAD_TOTAL_SHARDS],
             payload_len: None,
             shard_len: None,
             payload_hash: None,
+            bridge_payload,
+            chunks_reconstructed: false,
         }
     }
 
@@ -408,16 +489,15 @@ impl RsSubnetState {
     }
 }
 
-fn publish_rs_subnets(
+fn publish_rs_subnet_shards(
     swarm: &mut Swarm<SimBehaviour>,
     payload: &[u8],
-    reconstructed: &mut bool,
-) {
+) -> Option<(usize, usize, [u8; 32])> {
     let (shard_len, payload_hash, shards) = match encode_payload_shards(payload) {
         Ok(encoded) => encoded,
         Err(err) => {
             warn!(%err, "rs-subnets encode failed");
-            return;
+            return None;
         }
     };
     let mut published = 0usize;
@@ -438,6 +518,14 @@ fn publish_rs_subnets(
             Err(err) => warn!(column = i, %err, "rs-subnets column publish failed"),
         }
     }
+    Some((published, shard_len, payload_hash))
+}
+
+fn publish_rs_subnets(swarm: &mut Swarm<SimBehaviour>, payload: &[u8], reconstructed: &mut bool) {
+    let Some((published, shard_len, payload_hash)) = publish_rs_subnet_shards(swarm, payload)
+    else {
+        return;
+    };
     event!(
         "payload_published",
         bytes = payload.len(),
@@ -448,7 +536,26 @@ fn publish_rs_subnets(
     mark_reconstructed(reconstructed, payload);
 }
 
+fn publish_hybrid(swarm: &mut Swarm<SimBehaviour>, payload: &[u8], reconstructed: &mut bool) {
+    let full_payload_published = gossipsub_publish_payload(swarm, payload);
+    let (shards, shard_len, hash) = publish_rs_subnet_shards(swarm, payload)
+        .map(|(shards, shard_len, hash)| (shards, shard_len, hex_bytes(&hash)))
+        .unwrap_or((0, 0, payload_hash(payload)));
+    if full_payload_published || shards > 0 {
+        event!(
+            "payload_published",
+            bytes = payload.len(),
+            hash = hash,
+            full_payload = full_payload_published,
+            shards = shards,
+            shard_len = shard_len
+        );
+    }
+    mark_reconstructed(reconstructed, payload);
+}
+
 fn handle_rs_subnets(
+    swarm: &mut Swarm<SimBehaviour>,
     state: &mut RsSubnetState,
     reconstructed: &mut bool,
     topic: &str,
@@ -477,7 +584,7 @@ fn handle_rs_subnets(
         added = 1,
         distinct = distinct
     );
-    if *reconstructed || distinct < PAYLOAD_DATA_SHARDS {
+    if state.chunks_reconstructed || distinct < PAYLOAD_DATA_SHARDS {
         return;
     }
     let (Some(payload_len), Some(shard_len), Some(hash)) =
@@ -492,7 +599,17 @@ fn handle_rs_subnets(
         .filter_map(|(i, s)| s.clone().map(|d| (i, d)))
         .collect();
     match decode_payload(payload_len, shard_len, &hash, &present) {
-        Ok((payload, _)) => mark_reconstructed(reconstructed, &payload),
+        Ok((payload, _)) => {
+            state.chunks_reconstructed = true;
+            mark_reconstructed(reconstructed, &payload);
+            if state.bridge_payload && gossipsub_publish_payload(swarm, &payload) {
+                event!(
+                    "payload_bridged",
+                    bytes = payload.len(),
+                    hash = payload_hash(&payload)
+                );
+            }
+        }
         Err(err) => warn!(%err, "rs-subnets reconstruct failed"),
     }
 }
@@ -519,7 +636,13 @@ fn handle_swarm_event(
             ..
         })) => {
             if let Some(state) = rs_subnets.as_mut() {
-                handle_rs_subnets(state, reconstructed, message.topic.as_str(), &message.data);
+                handle_rs_subnets(
+                    swarm,
+                    state,
+                    reconstructed,
+                    message.topic.as_str(),
+                    &message.data,
+                );
             }
         }
         SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Partial {
@@ -701,7 +824,7 @@ async fn main() {
 
     if !matches!(
         cli.mode,
-        Mode::Gossipsub | Mode::RsPartial | Mode::RsSubnets | Mode::Rlnc
+        Mode::Gossipsub | Mode::RsPartial | Mode::RsSubnets | Mode::Hybrid | Mode::Rlnc
     ) {
         eprintln!("error: mode {} is not implemented yet", cli.mode);
         std::process::exit(1);
@@ -752,6 +875,22 @@ async fn main() {
                     .expect("subscribe to column topic");
             }
         }
+        Mode::Hybrid => {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&topic)
+                .expect("subscribe to payload topic");
+            if chunk_subscriber(cli.mode, cli.rs_subnet_subscriber) {
+                for i in 0..NUM_COLUMNS {
+                    swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .subscribe(&column_topic(i))
+                        .expect("subscribe to column topic");
+                }
+            }
+        }
         Mode::Rlnc => {}
         _ => {
             swarm
@@ -773,7 +912,8 @@ async fn main() {
         header_tracker: PayloadChunkHeaderTracker::new(4),
         recipients: cli.payload_chunk_recipients,
     });
-    let mut rs_subnets = (cli.mode == Mode::RsSubnets).then(RsSubnetState::new);
+    let mut rs_subnets = chunk_subscriber(cli.mode, cli.rs_subnet_subscriber)
+        .then(|| RsSubnetState::new(cli.mode == Mode::Hybrid));
     let mut rlnc_state = (cli.mode == Mode::Rlnc).then(|| {
         RlncState::new(cli.rlnc_chunks, cli.rlnc_fanout, cli.seed)
     });
@@ -832,6 +972,9 @@ async fn main() {
                                 Mode::RsSubnets => {
                                     publish_rs_subnets(&mut swarm, &payload, &mut reconstructed);
                                 }
+                                Mode::Hybrid if chunk_subscriber(cli.mode, cli.rs_subnet_subscriber) => {
+                                    publish_hybrid(&mut swarm, &payload, &mut reconstructed);
+                                }
                                 Mode::Rlnc => {
                                     if let Some(state) = rlnc_state.as_mut() {
                                         publish_rlnc(
@@ -843,7 +986,7 @@ async fn main() {
                                         );
                                     }
                                 }
-                                _ => {
+                                Mode::Gossipsub | Mode::Hybrid => {
                                     publish_gossipsub(&mut swarm, &payload);
                                     mark_reconstructed(&mut reconstructed, &payload);
                                 }
@@ -880,6 +1023,53 @@ mod tests {
         let cli = Cli::try_parse_from(["ec-sim"]).unwrap();
         assert_eq!(cli.mode, Mode::Gossipsub);
         assert!(gossip_tuning(&cli).validate().is_ok());
+    }
+
+    #[test]
+    fn hybrid_cli_assigns_the_chunk_subscriber_role() {
+        let cli =
+            Cli::try_parse_from(["ec-sim", "--mode", "hybrid", "--rs-subnet-subscriber"]).unwrap();
+        assert_eq!(cli.mode, Mode::Hybrid);
+        assert!(cli.rs_subnet_subscriber);
+    }
+
+    #[test]
+    fn chunk_subscriber_only_enables_hybrid_role_or_rs_subnets() {
+        assert!(chunk_subscriber(Mode::RsSubnets, false));
+        assert!(chunk_subscriber(Mode::Hybrid, true));
+        assert!(!chunk_subscriber(Mode::Hybrid, false));
+        assert!(!chunk_subscriber(Mode::Gossipsub, true));
+    }
+
+    #[test]
+    fn modes_use_their_topic_class_mesh_profile() {
+        let tuning = GossipTuning {
+            execution: MeshTuning {
+                mesh_n: 10,
+                ..Default::default()
+            },
+            subnet: MeshTuning {
+                mesh_n: 20,
+                ..Default::default()
+            },
+            partial: MeshTuning {
+                mesh_n: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(primary_mesh_tuning(Mode::Gossipsub, &tuning), tuning.execution);
+        assert_eq!(primary_mesh_tuning(Mode::Hybrid, &tuning), tuning.execution);
+        assert_eq!(primary_mesh_tuning(Mode::RsSubnets, &tuning), tuning.subnet);
+        assert_eq!(primary_mesh_tuning(Mode::RsPartial, &tuning), tuning.partial);
+    }
+
+    #[test]
+    fn hybrid_uses_the_payload_mesh() {
+        assert_eq!(
+            mesh_topic(Mode::Hybrid).to_string(),
+            payload_topic().to_string()
+        );
     }
 
     #[test]

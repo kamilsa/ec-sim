@@ -43,11 +43,14 @@ CL_PORT = 9000  # libp2p QUIC (UDP)
 EC_SIM_BIN_DOCKER = "/opt/ecsim/ec-sim"
 EC_SIM_BIN_NATIVE = str(REPO_ROOT / "target" / "release" / "ec-sim")
 
-MODES = {"gossipsub", "rs-partial", "rs-subnets", "rlnc"}
+MODES = {"gossipsub", "rs-partial", "rs-subnets", "hybrid", "rlnc"}
+HYBRID_SELECTIONS = {"fraction", "supernodes"}
 DEFAULT_MODE = "gossipsub"
 DEFAULT_FLOOD_PUBLISH = False
 DEFAULT_GOSSIP_LAZY = 0
 DEFAULT_GOSSIP_FACTOR = 0.0
+MESH_PROFILES = ("execution", "subnet", "partial")
+LEGACY_MESH_KEYS = ("mesh_n", "mesh_n_low", "mesh_n_high", "mesh_outbound_min")
 DEFAULT_MESH_N = 8
 DEFAULT_MESH_N_LOW = 6
 DEFAULT_MESH_N_HIGH = 12
@@ -58,6 +61,8 @@ DEFAULT_OBSERVE_SECS = 20
 DEFAULT_PAYLOAD_CHUNK_RECIPIENTS = 4
 DEFAULT_RLNC_CHUNKS = 10
 DEFAULT_RLNC_FANOUT = 40
+DEFAULT_HYBRID_SELECTION = "fraction"
+DEFAULT_HYBRID_RS_SUBNET_FRACTION = 0.0
 DEFAULT_NODES = 128
 DEFAULT_PEERS_PER_NODE = 50
 
@@ -90,6 +95,17 @@ def mode_setting(sim: dict) -> str:
     return mode
 
 
+def hybrid_settings(sim: dict) -> tuple[str, float]:
+    selection = sim.get("hybrid_selection", DEFAULT_HYBRID_SELECTION)
+    if not isinstance(selection, str) or selection not in HYBRID_SELECTIONS:
+        die("[sim].hybrid_selection must be one of: "
+            f"{', '.join(sorted(HYBRID_SELECTIONS))}")
+    fraction = sim.get("hybrid_rs_subnet_fraction", DEFAULT_HYBRID_RS_SUBNET_FRACTION)
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 <= fraction <= 1:
+        die("[sim].hybrid_rs_subnet_fraction must be a number between 0 and 1")
+    return selection, float(fraction)
+
+
 def gossip_tuning_settings(sim: dict) -> tuple[bool, int, float]:
     flood = sim.get("flood_publish", DEFAULT_FLOOD_PUBLISH)
     if not isinstance(flood, bool):
@@ -103,25 +119,33 @@ def gossip_tuning_settings(sim: dict) -> tuple[bool, int, float]:
     return flood, lazy, float(factor)
 
 
-def mesh_settings(sim: dict) -> tuple[int, int, int, int]:
+def mesh_settings(sim: dict, profile: str) -> tuple[int, int, int, int]:
+    if profile not in MESH_PROFILES:
+        raise ValueError(f"unknown mesh profile: {profile}")
+    legacy = [key for key in LEGACY_MESH_KEYS if key in sim]
+    if legacy:
+        die("[sim] generic mesh settings were replaced; use "
+            f"{profile}_mesh_* (remove: {', '.join(legacy)})")
+
     def _count(key: str, default: int) -> int:
         value = sim.get(key, default)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             die(f"[sim].{key} must be a non-negative integer")
         return value
 
-    mesh_n = _count("mesh_n", DEFAULT_MESH_N)
-    low = _count("mesh_n_low", DEFAULT_MESH_N_LOW)
-    high = _count("mesh_n_high", DEFAULT_MESH_N_HIGH)
-    outbound = _count("mesh_outbound_min", DEFAULT_MESH_OUTBOUND_MIN)
+    prefix = f"{profile}_mesh"
+    mesh_n = _count(f"{prefix}_n", DEFAULT_MESH_N)
+    low = _count(f"{prefix}_n_low", DEFAULT_MESH_N_LOW)
+    high = _count(f"{prefix}_n_high", DEFAULT_MESH_N_HIGH)
+    outbound = _count(f"{prefix}_outbound_min", DEFAULT_MESH_OUTBOUND_MIN)
 
     if not (outbound <= low <= mesh_n <= high):
-        die("[sim] gossipsub mesh parameters must satisfy mesh_outbound_min <= "
-            f"mesh_n_low <= mesh_n <= mesh_n_high, got {outbound} <= {low} <= "
+        die(f"[sim] {profile} mesh parameters must satisfy {prefix}_outbound_min <= "
+            f"{prefix}_n_low <= {prefix}_n <= {prefix}_n_high, got {outbound} <= {low} <= "
             f"{mesh_n} <= {high}")
     if outbound * 2 > mesh_n:
-        die("[sim] gossipsub mesh parameters must satisfy mesh_outbound_min * 2 <= "
-            f"mesh_n, got {outbound} * 2 > {mesh_n}")
+        die(f"[sim] {profile} mesh parameters must satisfy {prefix}_outbound_min * 2 <= "
+            f"{prefix}_n, got {outbound} * 2 > {mesh_n}")
     return mesh_n, low, high, outbound
 
 
@@ -151,6 +175,7 @@ class Node:
         self.bandwidth_up = ""
         self.bandwidth_down = ""
         self.is_supernode = False
+        self.is_rs_subnet_subscriber = False
 
 
 def build_nodes(cfg: dict) -> list[Node]:
@@ -177,6 +202,30 @@ def assign_supernodes(nodes: list[Node], fraction: float, rng: random.Random) ->
         for node in rng.sample(nodes, count):
             node.is_supernode = True
     return count
+
+
+def assign_hybrid_subscribers(nodes: list[Node], mode: str, selection: str,
+                              fraction: float, seed: int) -> list[Node]:
+    """Select chunk subscribers without perturbing topology RNG streams."""
+    if mode != "hybrid":
+        return []
+
+    if selection == "supernodes":
+        selected = [nodes[0]]
+        selected.extend(node for node in nodes[1:] if node.is_supernode)
+        if len(selected) < 2:
+            die("[sim].hybrid_selection = \"supernodes\" requires at least one "
+                "supernode besides the builder")
+    else:
+        count = int(len(nodes) * fraction + 0.5)
+        if count < 2:
+            die("[sim].hybrid_rs_subnet_fraction must select at least two chunk subscribers")
+        selected = [nodes[0]]
+        selected.extend(random.Random(seed + 2).sample(nodes[1:], count - 1))
+
+    for node in selected:
+        node.is_rs_subnet_subscriber = True
+    return selected
 
 
 def generate_gml(nodes: list[Node], jitter_ratio: float, packet_loss: float,
@@ -308,16 +357,20 @@ def build_args(node: Node, cfg: dict, peers: list[str],
     ]
     if node.is_builder:
         parts.append("--builder")
+    if node.is_rs_subnet_subscriber:
+        parts.append("--rs-subnet-subscriber")
     if peer_list is not None:
         parts += ["--peer-list", str(peer_list)]
     flood, lazy, factor = gossip_tuning_settings(sim)
     if flood:
         parts.append("--flood-publish")
     parts += ["--gossip-lazy", str(lazy), "--gossip-factor", str(factor)]
-    mesh_n, mesh_low, mesh_high, mesh_outbound = mesh_settings(sim)
-    parts += ["--mesh-n", str(mesh_n), "--mesh-n-low", str(mesh_low),
-              "--mesh-n-high", str(mesh_high),
-              "--mesh-outbound-min", str(mesh_outbound)]
+    for profile in MESH_PROFILES:
+        mesh_n, mesh_low, mesh_high, mesh_outbound = mesh_settings(sim, profile)
+        parts += [f"--{profile}-mesh-n", str(mesh_n),
+                  f"--{profile}-mesh-n-low", str(mesh_low),
+                  f"--{profile}-mesh-n-high", str(mesh_high),
+                  f"--{profile}-mesh-outbound-min", str(mesh_outbound)]
     for p in peers:
         parts += ["--peer", p]
     return " ".join(parts)
@@ -463,7 +516,7 @@ def summarize(out_dir: Path) -> None:
 
 
 def _generate_run(cfg: dict, out_dir: Path, seed: int,
-                  ec_sim_bin: str, image: str | None = None) -> int:
+                  ec_sim_bin: str, image: str | None = None) -> tuple[int, dict]:
     cfg["sim"]["seed"] = seed
     net = cfg["network"]
     jitter_ratio = float(net.get("jitter_ratio", 0.3))
@@ -490,6 +543,9 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int,
     geo_rng = random.Random(seed)
     regions = weighted_assign(region_weights, n, geo_rng)
     supernode_count = assign_supernodes(nodes, supernode_fraction, geo_rng)
+    hybrid_selection, hybrid_fraction = hybrid_settings(cfg["sim"])
+    hybrid_subscribers = assign_hybrid_subscribers(
+        nodes, mode_setting(cfg["sim"]), hybrid_selection, hybrid_fraction, seed)
     for node, region in zip(nodes, regions):
         node.region = region
         if node.is_supernode:
@@ -505,7 +561,8 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int,
         json.dumps({node.name: node.region for node in nodes}, indent=2))
     (out_dir / "bandwidths.json").write_text(json.dumps({
         node.name: {"up": node.bandwidth_up, "down": node.bandwidth_down,
-                    "supernode": node.is_supernode}
+                    "supernode": node.is_supernode,
+                    "rs_subnet_subscriber": node.is_rs_subnet_subscriber}
         for node in nodes
     }, indent=2))
 
@@ -521,8 +578,13 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int,
     for x in nodes:
         region_counts[x.region] = region_counts.get(x.region, 0) + 1
     log(f"  {n} hosts (builder={nodes[0].name}); {supernode_count} supernodes; "
-        f"regions {region_counts}")
-    return n
+        f"{len(hybrid_subscribers)} hybrid chunk subscribers; regions {region_counts}")
+    return n, {
+        "hybrid_selection": hybrid_selection,
+        "hybrid_rs_subnet_fraction": hybrid_fraction,
+        "rs_subnet_subscriber_count": len(hybrid_subscribers),
+        "rs_subnet_subscribers": [node.name for node in hybrid_subscribers],
+    }
 
 
 def analyze_and_serve(out_dir: Path, overlays: list[Path], serve: bool,
@@ -573,7 +635,9 @@ def main() -> None:
 
     sim_cfg = cfg.get("sim", {})
     mode_setting(sim_cfg)
-    mesh_settings(sim_cfg)
+    hybrid_settings(sim_cfg)
+    for profile in MESH_PROFILES:
+        mesh_settings(sim_cfg, profile)
     gossip_tuning_settings(sim_cfg)
 
     out_dir = Path(cfg["output"]["dir"])
@@ -633,7 +697,7 @@ def main() -> None:
         run_seed = base_seed + run_index
         if runs > 1:
             log(f"─── run {run_index + 1}/{runs}  (seed {run_seed}) ───")
-        _generate_run(cfg, out_dir, run_seed, ec_sim_bin, image)
+        _, hybrid_meta = _generate_run(cfg, out_dir, run_seed, ec_sim_bin, image)
         log(f"  runner: {runner}  mode: {mode_setting(sim_cfg)}")
 
         if args.dry_run:
@@ -647,7 +711,15 @@ def main() -> None:
             native_run_shadow(out_dir)
 
         flood, lazy, factor = gossip_tuning_settings(sim_cfg)
-        mesh_n, mesh_low, mesh_high, mesh_outbound = mesh_settings(sim_cfg)
+        mesh_meta = {}
+        for profile in MESH_PROFILES:
+            mesh_n, mesh_low, mesh_high, mesh_outbound = mesh_settings(sim_cfg, profile)
+            mesh_meta.update({
+                f"{profile}_mesh_n": mesh_n,
+                f"{profile}_mesh_n_low": mesh_low,
+                f"{profile}_mesh_n_high": mesh_high,
+                f"{profile}_mesh_outbound_min": mesh_outbound,
+            })
         (out_dir / "run-meta.json").write_text(json.dumps(
             {"seed": run_seed, "run_index": run_index, "runs": runs,
              "mode": mode_setting(sim_cfg),
@@ -655,13 +727,11 @@ def main() -> None:
                                                DEFAULT_PAYLOAD_SIZE_KIB),
              "warmup_secs": _nonneg_int(sim_cfg, "warmup_secs", DEFAULT_WARMUP_SECS),
              "observe_secs": _nonneg_int(sim_cfg, "observe_secs", DEFAULT_OBSERVE_SECS),
-             "flood_publish": flood,
-             "gossip_lazy": lazy,
-             "gossip_factor": factor,
-             "mesh_n": mesh_n,
-             "mesh_n_low": mesh_low,
-             "mesh_n_high": mesh_high,
-             "mesh_outbound_min": mesh_outbound},
+              "flood_publish": flood,
+              "gossip_lazy": lazy,
+              "gossip_factor": factor,
+              **mesh_meta,
+              **hybrid_meta},
             indent=2))
         summarize(out_dir)
         analyze_and_serve(out_dir, overlays, serve=False, append=True)

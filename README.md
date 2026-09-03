@@ -5,8 +5,9 @@ Minimal Rust + rust-libp2p payload-propagation simulator that runs under
 UX as blobsim (`--rebuild`, `--clean`, `--dry-run`), without an execution layer,
 blobs, slot ticker, or zk-attesters.
 
-One homogeneous network, one protocol per run. Connections warm up, the builder
-publishes a **single payload**, every node observes, then exits.
+One propagation mode per run. Connections warm up, the builder publishes a
+**single payload**, every node observes, then exits. Hybrid mode assigns a
+subset of nodes an additional chunk-subscriber role.
 
 ## Modes
 
@@ -15,10 +16,34 @@ publishes a **single payload**, every node observes, then exits.
 | `gossipsub` | Topic `/ec/payload/1`, one full message | First full message |
 | `rs-partial` | Topic `/ec/payload_chunks/1`, gossipsub 1.3 partials | Any 64 of 128 RS shards |
 | `rs-subnets` | Topics `/ec/payload_column/{0..127}/1` | Any 64 of 128 RS shards |
+| `hybrid` | Every node: `/ec/payload/1`; selected nodes: all 128 RS column topics | First full payload or any 64 shards; chunk reconstruction re-gossips the full payload |
 | `rlnc` | Custom `/ec-sim/rlnc/1.0.0` push | Rank `N` (default 10) |
 
-All four modes are implemented. Flip `[sim].mode` and rerun the same topology
+All five modes are implemented. Flip `[sim].mode` and rerun the same topology
 to compare time-to-N% reach and bytes sent.
+
+### Hybrid roles
+
+Set `[sim].hybrid_selection` to `fraction` to select a deterministic random
+portion of nodes via `[sim].hybrid_rs_subnet_fraction`, or `supernodes` to
+select every generated supernode. The builder is always included so it can
+seed the subnet meshes with shards. The selected fraction and the supernode
+selection must produce at least two chunk subscribers.
+
+The builder publishes both the full payload and all RS shards. A hybrid node
+that reconstructs from 64 shards publishes the recovered payload on
+`/ec/payload/1` and emits `payload_bridged`. Since ordinary payload gossip can
+reconstruct every node independently, use `shard_received`, `payload_bridged`,
+and the per-node role recorded in `bandwidths.json` to evaluate the chunk path.
+
+### Topic Mesh Degrees
+
+Configure each gossipsub topic class independently with the four `D` values:
+`execution_mesh_*` controls `/ec/payload/1`, `subnet_mesh_*` controls every
+`/ec/payload_column/{0..127}/1` topic, and `partial_mesh_*` controls
+`/ec/payload_chunks/1`. Each profile supplies `_n`, `_n_low`, `_n_high`, and
+`_outbound_min`, and must satisfy `outbound_min <= n_low <= n <= n_high` plus
+`2 * outbound_min <= n`. The old generic `mesh_*` settings are rejected.
 
 ## Run
 
