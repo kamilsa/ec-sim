@@ -8,6 +8,7 @@ use libp2p::{
     swarm::NetworkBehaviour,
     Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tracing::info;
 
@@ -169,6 +170,15 @@ fn configure_topic_mesh(
         .mesh_outbound_min_for_topic(tuning.mesh_outbound_min, topic);
 }
 
+fn content_message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
+    let topic = message.topic.as_str().as_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update((topic.len() as u64).to_le_bytes());
+    hasher.update(topic);
+    hasher.update(&message.data);
+    gossipsub::MessageId::from(hasher.finalize().to_vec())
+}
+
 fn gossipsub_config(tuning: &GossipTuning) -> gossipsub::Config {
     let mut builder = gossipsub::ConfigBuilder::default();
     builder
@@ -184,6 +194,9 @@ fn gossipsub_config(tuning: &GossipTuning) -> gossipsub::Config {
         .history_length(5)
         .history_gossip(3)
         .max_transmit_size(16 * 1024 * 1024)
+        // Reconstructed hybrid payloads have the original bytes. Give them the
+        // same ID as the builder's publication so bridge attempts deduplicate.
+        .message_id_fn(content_message_id)
         .validation_mode(gossipsub::ValidationMode::Permissive);
     configure_topic_mesh(&mut builder, payload_topic().hash(), tuning.execution);
     configure_topic_mesh(&mut builder, payload_chunk_topic().hash(), tuning.partial);
@@ -397,6 +410,57 @@ mod tests {
                 expected.mesh_outbound_min
             );
         }
+    }
+
+    #[test]
+    fn payload_message_ids_ignore_publisher_and_sequence() {
+        let config = gossipsub_config(&GossipTuning::default());
+        let data = b"reconstructed payload".to_vec();
+        let builder_message = gossipsub::Message {
+            source: Some(PeerId::from(keypair_from_seed(42).public())),
+            data: data.clone(),
+            sequence_number: Some(1),
+            topic: payload_topic().hash(),
+        };
+        let bridged_message = gossipsub::Message {
+            source: Some(PeerId::from(keypair_from_seed(43).public())),
+            data,
+            sequence_number: Some(99),
+            topic: payload_topic().hash(),
+        };
+
+        assert_eq!(
+            config.message_id(&builder_message),
+            config.message_id(&bridged_message)
+        );
+    }
+
+    #[test]
+    fn content_message_ids_include_topic_and_payload() {
+        let config = gossipsub_config(&GossipTuning::default());
+        let message = gossipsub::Message {
+            source: Some(PeerId::from(keypair_from_seed(42).public())),
+            data: b"payload".to_vec(),
+            sequence_number: Some(1),
+            topic: payload_topic().hash(),
+        };
+        let different_topic = gossipsub::Message {
+            topic: column_topic(0).hash(),
+            ..message.clone()
+        };
+        let different_payload = gossipsub::Message {
+            data: b"other payload".to_vec(),
+            ..message.clone()
+        };
+
+        assert_ne!(
+            config.message_id(&message),
+            config.message_id(&different_topic)
+        );
+        assert_ne!(
+            config.message_id(&message),
+            config.message_id(&different_payload)
+        );
     }
 
     #[test]
