@@ -722,6 +722,7 @@ def main() -> None:
             })
         (out_dir / "run-meta.json").write_text(json.dumps(
             {"seed": run_seed, "run_index": run_index, "runs": runs,
+             "title": str(sim_cfg.get("title") or ""),
              "mode": mode_setting(sim_cfg),
              "payload_size_kib": _positive_int(sim_cfg, "payload_size_kib",
                                                DEFAULT_PAYLOAD_SIZE_KIB),

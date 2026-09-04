@@ -138,6 +138,7 @@ def collect_run(run_dir: Path) -> dict:
     return {
         "dir": str(run_dir.resolve()),
         "label": str(meta.get("mode") or run_dir.name),
+        "title": meta.get("title"),
         "seed": meta.get("seed"),
         "run_index": meta.get("run_index"),
         "n_hosts": n,
@@ -238,6 +239,7 @@ def make_snapshot(run: dict, recorded_at: str | None = None) -> dict:
         "recorded_at": recorded_at,
         "dir": str(Path(run["dir"]).resolve()),
         "label": label,
+        "title": run.get("title"),
         "seed": seed,
         "run_index": run_index,
         "n_hosts": run["n_hosts"],
@@ -335,7 +337,7 @@ def write_html(runs: list[dict], out_path: Path) -> None:
 
     columns = [
         ("time", "time", True),
-        ("seed", "seed", False),
+        ("title", "title", True),
         ("mode", "mode", True),
         ("hosts", "hosts", False),
         ("reconstructed", "reconstructed", False),
@@ -350,7 +352,7 @@ def write_html(runs: list[dict], out_path: Path) -> None:
     for i, run in enumerate(runs):
         values = {
             "time": _fmt_time(run.get("recorded_at")),
-            "seed": _fmt_cell(run.get("seed")),
+            "title": _fmt_cell(run.get("title")),
             "mode": run.get("label") or "NA",
             "hosts": _fmt_cell(run.get("n_hosts")),
             "reconstructed": _fmt_cell(run.get("reconstructed")),
@@ -669,6 +671,7 @@ def _write_fixture(root: Path) -> Path:
         (host / "ec-sim.1000.stdout").write_text(block + "\n")
     (run / "run-meta.json").write_text(json.dumps({
         "mode": "gossipsub",
+        "title": "Gossipsub baseline",
         "seed": 42,
         "run_index": 0,
     }))
@@ -719,6 +722,7 @@ def self_test() -> None:
         assert summary["t95_ms"] is None  # 95% of 4 is 4 reconstructed, only 3 did
         assert summary["sent_sum"] == 1000 + 200 + 180 + 50
         assert summary["rcvd_sum"] == 10 + 1200 + 1180 + 40
+        assert summary["title"] == "Gossipsub baseline"
         assert summary["seed"] == 42
         assert summary["run_index"] == 0
         html = run_dir / HTML_NAME
@@ -727,6 +731,7 @@ def self_test() -> None:
 
         hist = update_history(run_dir, [], append=True, verbose=False)
         assert len(hist) == 1
+        assert hist[0]["title"] == "Gossipsub baseline"
         assert hist[0]["seed"] == 42
         assert hist[0]["run_index"] == 0
         assert hist[0]["t95_ms"] is None
@@ -743,6 +748,8 @@ def self_test() -> None:
         assert "data-idx" in text
         assert 'id="cdf"' in text
         assert 'id="node-select"' in text
+        assert ">title<" in text
+        assert "Gossipsub baseline" in text
         assert ">t95_ms<" in text
         assert ">sent_mean<" in text
         assert ">rcvd_mean<" in text

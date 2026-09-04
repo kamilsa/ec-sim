@@ -13,6 +13,7 @@ runner = "docker"
 
 [sim]
 mode = "gossipsub"           # gossipsub | rs-partial | rs-subnets | hybrid | rlnc
+title = "Gossipsub baseline" # label shown in summary.html
 seed = 42                     # master RNG seed (topology + per-node keypairs)
 runs = 1                      # number of runs; run i uses seed+i
 payload_size_kib = 256        # payload the builder publishes once after warmup
