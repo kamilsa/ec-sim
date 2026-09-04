@@ -33,6 +33,7 @@ use futures::StreamExt;
 use libp2p::{gossipsub, request_response, swarm::SwarmEvent, Multiaddr, PeerId, Swarm};
 use std::sync::Arc;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -738,13 +739,19 @@ impl RlncState {
     }
 }
 
-fn pick_fanout(swarm: &Swarm<SimBehaviour>, exclude: Option<PeerId>, fanout: usize) -> Vec<PeerId> {
+fn pick_fanout(
+    swarm: &Swarm<SimBehaviour>,
+    exclude: Option<PeerId>,
+    fanout: usize,
+    rng: &mut StdRng,
+) -> Vec<PeerId> {
     let mut peers: Vec<PeerId> = swarm
         .connected_peers()
         .copied()
         .filter(|p| exclude != Some(*p))
         .collect();
     peers.sort();
+    peers.shuffle(rng);
     let take = fanout.min(peers.len());
     peers.truncate(take);
     peers
@@ -754,7 +761,7 @@ fn rlnc_push(swarm: &mut Swarm<SimBehaviour>, state: &mut RlncState, exclude: Op
     if state.held.is_empty() {
         return;
     }
-    for peer in pick_fanout(swarm, exclude, state.fanout) {
+    for peer in pick_fanout(swarm, exclude, state.fanout, &mut state.rng) {
         let Some(coded) = recode(&state.held, &mut state.rng) else {
             continue;
         };

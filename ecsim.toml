@@ -12,8 +12,8 @@
 runner = "docker"
 
 [sim]
-mode = "gossipsub"           # gossipsub | rs-partial | rs-subnets | hybrid | rlnc
-title = "Gossipsub baseline" # label shown in summary.html
+mode = "rlnc"           # gossipsub | rs-partial | rs-subnets | hybrid | rlnc
+title = "rlnc-15-18" # label shown in summary.html
 seed = 42                     # master RNG seed (topology + per-node keypairs)
 runs = 1                      # number of runs; run i uses seed+i
 payload_size_kib = 256        # payload the builder publishes once after warmup
@@ -22,8 +22,8 @@ observe_secs = 20             # window after publish before every node exits
 # rs-partial tuned profile (128 nodes, seed 42): 3 recipients/shard; mesh
 # 60/80/90 with 18 outbound peers. Validated at 128/128 reconstructed, t95=856 ms.
 payload_chunk_recipients = 3  # rs-partial: mesh peers seeded per shard
-rlnc_chunks = 10              # RLNC source-packet count N
-rlnc_fanout = 40              # RLNC push degree D (independent of gossipsub meshes)
+rlnc_chunks = 15              # RLNC source-packet count N
+rlnc_fanout = 18              # RLNC push degree D (independent of gossipsub meshes)
 # hybrid: every node receives full payload gossip; selected nodes also receive
 # all RS column subnets and re-gossip a chunk-reconstructed payload. "fraction"
 # selects a seeded random subset (including the builder); "supernodes" selects
@@ -61,7 +61,7 @@ rust_log = "info"
 # stop_time = "90s"           # optional; default = warmup_secs + observe_secs + 60s
 
 [topology]
-nodes = 512                   # including the builder (node 0)
+nodes = 128                   # including the builder (node 0)
 peers_per_node = 50           # random QUIC peers each node dials
 
 # Geo-realistic network. A seeded fraction of hosts are supernodes with 1 Gbit
