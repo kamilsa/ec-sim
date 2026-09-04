@@ -14,12 +14,13 @@ subset of nodes an additional chunk-subscriber role.
 | `--mode` / `[sim].mode` | Wire | Reconstruct |
 |---|---|---|
 | `gossipsub` | Topic `/ec/payload/1`, one full message | First full message |
+| `gossipsub-chunked` | Topic `/ec/payload_chunked/1`, configurable raw chunks (default 64) | All chunks, then SHA-256 verification |
 | `rs-partial` | Topic `/ec/payload_chunks/1`, gossipsub 1.3 partials | Any 64 of 128 RS shards |
 | `rs-subnets` | Topics `/ec/payload_column/{0..127}/1` | Any 64 of 128 RS shards |
 | `hybrid` | Every node: `/ec/payload/1`; selected nodes: all 128 RS column topics | First full payload or any 64 shards; chunk reconstruction re-gossips the full payload |
 | `rlnc` | Custom `/ec-sim/rlnc/1.0.0` push | Rank `N` (default 10) |
 
-All five modes are implemented. Flip `[sim].mode` and rerun the same topology
+All six modes are implemented. Flip `[sim].mode` and rerun the same topology
 to compare time-to-N% reach and bytes sent.
 
 ### Hybrid roles
@@ -41,9 +42,20 @@ and the per-node role recorded in `bandwidths.json` to evaluate the chunk path.
 Configure each gossipsub topic class independently with the four `D` values:
 `execution_mesh_*` controls `/ec/payload/1`, `subnet_mesh_*` controls every
 `/ec/payload_column/{0..127}/1` topic, and `partial_mesh_*` controls
-`/ec/payload_chunks/1`. Each profile supplies `_n`, `_n_low`, `_n_high`, and
-`_outbound_min`, and must satisfy `outbound_min <= n_low <= n <= n_high` plus
-`2 * outbound_min <= n`. The old generic `mesh_*` settings are rejected.
+`/ec/payload_chunks/1`. `chunked_mesh_*` controls `/ec/payload_chunked/1`.
+Each profile supplies `_n`, `_n_low`, `_n_high`, and `_outbound_min`, and must
+satisfy `outbound_min <= n_low <= n <= n_high` plus `2 * outbound_min <= n`.
+The old generic `mesh_*` settings are rejected.
+
+### Chunked Gossipsub
+
+`gossipsub-chunked` sends the origin payload as contiguous normal-Gossipsub
+messages on `/ec/payload_chunked/1`. Set `[sim].gossipsub_chunk_count` to
+choose the number of chunks (default 64); when the payload is smaller than the
+requested count, it uses one non-empty chunk per payload byte. Every receiver
+needs all chunks and verifies the final SHA-256 commitment before reporting
+reconstruction. `[sim].chunked_gossip_lazy` configures its `D_lazy`; the global
+`gossip_factor` remains applicable to all Gossipsub modes.
 
 ## Run
 

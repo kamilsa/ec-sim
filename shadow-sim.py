@@ -43,13 +43,13 @@ CL_PORT = 9000  # libp2p QUIC (UDP)
 EC_SIM_BIN_DOCKER = "/opt/ecsim/ec-sim"
 EC_SIM_BIN_NATIVE = str(REPO_ROOT / "target" / "release" / "ec-sim")
 
-MODES = {"gossipsub", "rs-partial", "rs-subnets", "hybrid", "rlnc"}
+MODES = {"gossipsub", "gossipsub-chunked", "rs-partial", "rs-subnets", "hybrid", "rlnc"}
 HYBRID_SELECTIONS = {"fraction", "supernodes"}
 DEFAULT_MODE = "gossipsub"
 DEFAULT_FLOOD_PUBLISH = False
 DEFAULT_GOSSIP_LAZY = 0
 DEFAULT_GOSSIP_FACTOR = 0.0
-MESH_PROFILES = ("execution", "subnet", "partial")
+MESH_PROFILES = ("execution", "chunked", "subnet", "partial")
 LEGACY_MESH_KEYS = ("mesh_n", "mesh_n_low", "mesh_n_high", "mesh_outbound_min")
 DEFAULT_MESH_N = 8
 DEFAULT_MESH_N_LOW = 6
@@ -59,6 +59,8 @@ DEFAULT_PAYLOAD_SIZE_KIB = 256
 DEFAULT_WARMUP_SECS = 15
 DEFAULT_OBSERVE_SECS = 20
 DEFAULT_PAYLOAD_CHUNK_RECIPIENTS = 4
+DEFAULT_GOSSIPSUB_CHUNK_COUNT = 64
+DEFAULT_CHUNKED_GOSSIP_LAZY = 0
 DEFAULT_RLNC_CHUNKS = 10
 DEFAULT_RLNC_FANOUT = 40
 DEFAULT_HYBRID_SELECTION = "fraction"
@@ -352,6 +354,10 @@ def build_args(node: Node, cfg: dict, peers: list[str],
         "--observe-secs", str(_nonneg_int(sim, "observe_secs", DEFAULT_OBSERVE_SECS)),
         "--payload-chunk-recipients",
         str(_positive_int(sim, "payload_chunk_recipients", DEFAULT_PAYLOAD_CHUNK_RECIPIENTS)),
+        "--gossipsub-chunk-count",
+        str(_positive_int(sim, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT)),
+        "--chunked-gossip-lazy",
+        str(_nonneg_int(sim, "chunked_gossip_lazy", DEFAULT_CHUNKED_GOSSIP_LAZY)),
         "--rlnc-chunks", str(_positive_int(sim, "rlnc_chunks", DEFAULT_RLNC_CHUNKS)),
         "--rlnc-fanout", str(_positive_int(sim, "rlnc_fanout", DEFAULT_RLNC_FANOUT)),
     ]
@@ -639,6 +645,8 @@ def main() -> None:
     for profile in MESH_PROFILES:
         mesh_settings(sim_cfg, profile)
     gossip_tuning_settings(sim_cfg)
+    _positive_int(sim_cfg, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT)
+    _nonneg_int(sim_cfg, "chunked_gossip_lazy", DEFAULT_CHUNKED_GOSSIP_LAZY)
 
     out_dir = Path(cfg["output"]["dir"])
     if not out_dir.is_absolute():
@@ -726,9 +734,13 @@ def main() -> None:
              "mode": mode_setting(sim_cfg),
              "payload_size_kib": _positive_int(sim_cfg, "payload_size_kib",
                                                DEFAULT_PAYLOAD_SIZE_KIB),
-             "warmup_secs": _nonneg_int(sim_cfg, "warmup_secs", DEFAULT_WARMUP_SECS),
-             "observe_secs": _nonneg_int(sim_cfg, "observe_secs", DEFAULT_OBSERVE_SECS),
-              "flood_publish": flood,
+              "warmup_secs": _nonneg_int(sim_cfg, "warmup_secs", DEFAULT_WARMUP_SECS),
+              "observe_secs": _nonneg_int(sim_cfg, "observe_secs", DEFAULT_OBSERVE_SECS),
+              "gossipsub_chunk_count": _positive_int(
+                  sim_cfg, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT),
+              "chunked_gossip_lazy": _nonneg_int(
+                  sim_cfg, "chunked_gossip_lazy", DEFAULT_CHUNKED_GOSSIP_LAZY),
+               "flood_publish": flood,
               "gossip_lazy": lazy,
               "gossip_factor": factor,
               **mesh_meta,

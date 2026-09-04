@@ -12,8 +12,8 @@
 runner = "docker"
 
 [sim]
-mode = "rlnc"           # gossipsub | rs-partial | rs-subnets | hybrid | rlnc
-title = "rlnc-15-18" # label shown in summary.html
+mode = "rs-partial"           # gossipsub | gossipsub-chunked | rs-partial | rs-subnets | hybrid | rlnc
+title = "rs-partial" # label shown in summary.html
 seed = 42                     # master RNG seed (topology + per-node keypairs)
 runs = 1                      # number of runs; run i uses seed+i
 payload_size_kib = 256        # payload the builder publishes once after warmup
@@ -22,6 +22,8 @@ observe_secs = 20             # window after publish before every node exits
 # rs-partial tuned profile (128 nodes, seed 42): 3 recipients/shard; mesh
 # 60/80/90 with 18 outbound peers. Validated at 128/128 reconstructed, t95=856 ms.
 payload_chunk_recipients = 3  # rs-partial: mesh peers seeded per shard
+gossipsub_chunk_count = 64    # gossipsub-chunked: raw payload chunks
+chunked_gossip_lazy = 0       # gossipsub-chunked: D_lazy (other modes use gossip_lazy)
 rlnc_chunks = 15              # RLNC source-packet count N
 rlnc_fanout = 18              # RLNC push degree D (independent of gossipsub meshes)
 # hybrid: every node receives full payload gossip; selected nodes also receive
@@ -40,12 +42,17 @@ gossip_factor = 0.00
 # Per-topic mesh sizing. Every profile must satisfy:
 #   <profile>_mesh_outbound_min <= <profile>_mesh_n_low <= <profile>_mesh_n <= <profile>_mesh_n_high
 #   and 2 * <profile>_mesh_outbound_min <= <profile>_mesh_n
-# The execution and partial topics are broadly subscribed; column subnets are
-# subscribed only by hybrid nodes, so they use a smaller mesh.
+# The execution, chunked, and partial topics are broadly subscribed; column
+# subnets are subscribed only by hybrid nodes, so they use a smaller mesh.
 execution_mesh_n_low = 4
 execution_mesh_n = 8
 execution_mesh_n_high = 12
 execution_mesh_outbound_min = 3
+
+chunked_mesh_n_low = 4
+chunked_mesh_n = 8
+chunked_mesh_n_high = 12
+chunked_mesh_outbound_min = 3
 
 partial_mesh_n_low = 60
 partial_mesh_n = 80

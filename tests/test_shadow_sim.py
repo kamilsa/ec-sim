@@ -57,6 +57,10 @@ class HybridSubscriberSelectionTests(unittest.TestCase):
             "execution_mesh_n_low": 30,
             "execution_mesh_n_high": 50,
             "execution_mesh_outbound_min": 10,
+            "chunked_mesh_n": 16,
+            "chunked_mesh_n_low": 12,
+            "chunked_mesh_n_high": 20,
+            "chunked_mesh_outbound_min": 4,
             "subnet_mesh_n": 8,
             "subnet_mesh_n_low": 4,
             "subnet_mesh_n_high": 12,
@@ -68,6 +72,7 @@ class HybridSubscriberSelectionTests(unittest.TestCase):
         }}, [])
 
         self.assertIn("--execution-mesh-n 40", args)
+        self.assertIn("--chunked-mesh-n 16", args)
         self.assertIn("--subnet-mesh-n 8", args)
         self.assertIn("--partial-mesh-n 20", args)
         self.assertNotIn("--mesh-n", args)
@@ -75,6 +80,24 @@ class HybridSubscriberSelectionTests(unittest.TestCase):
     def test_generic_mesh_settings_are_rejected(self) -> None:
         with self.assertRaises(SystemExit):
             shadow_sim.mesh_settings({"mesh_n": 8}, "execution")
+
+    def test_chunked_mode_emits_its_chunk_and_lazy_gossip_settings(self) -> None:
+        args = shadow_sim.build_args(nodes(1)[0], {"sim": {
+            "mode": "gossipsub-chunked",
+            "seed": 42,
+            "gossipsub_chunk_count": 96,
+            "chunked_gossip_lazy": 7,
+        }}, [])
+
+        self.assertIn("--mode gossipsub-chunked", args)
+        self.assertIn("--gossipsub-chunk-count 96", args)
+        self.assertIn("--chunked-gossip-lazy 7", args)
+
+    def test_chunked_mode_rejects_non_positive_chunk_count(self) -> None:
+        with self.assertRaises(SystemExit):
+            shadow_sim.build_args(nodes(1)[0], {"sim": {
+                "mode": "gossipsub-chunked", "seed": 42, "gossipsub_chunk_count": 0,
+            }}, [])
 
 
 if __name__ == "__main__":

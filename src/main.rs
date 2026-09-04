@@ -8,6 +8,7 @@
 mod events;
 mod coding;
 mod network;
+mod gossipsub_chunks;
 mod payload_chunks;
 mod rlnc;
 mod rlnc_proto;
@@ -19,9 +20,10 @@ use crate::coding::{
 use crate::events::hex_bytes;
 use crate::network::{
     build_swarm, column_from_topic, column_topic, content_message_id_for, dial_peers, gossip_byte_totals, keypair_from_seed,
-    mesh_peer_count, payload_chunk_topic, payload_topic, subscribe_partial, GossipTuning, MeshTuning,
+    mesh_peer_count, payload_chunk_topic, payload_chunked_topic, payload_topic, subscribe_partial, GossipTuning, MeshTuning,
     SimBehaviour, SimBehaviourEvent, NUM_COLUMNS,
 };
+use crate::gossipsub_chunks::{split_payload, GossipsubChunkAssembler, GossipsubChunkMessage};
 use crate::payload_chunks::{
     assign_chunk_recipients, payload_hash_from_group_id, CellBitmap, OutgoingPayloadChunks,
     PartialPayloadChunks, PayloadChunkAssembler, PayloadChunkHeader, PayloadChunkHeaderTracker,
@@ -47,6 +49,8 @@ use tracing_subscriber::EnvFilter;
 enum Mode {
     #[default]
     Gossipsub,
+    #[value(name = "gossipsub-chunked")]
+    GossipsubChunked,
     #[value(name = "rs-partial")]
     RsPartial,
     #[value(name = "rs-subnets")]
@@ -59,12 +63,23 @@ impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Mode::Gossipsub => "gossipsub",
+            Mode::GossipsubChunked => "gossipsub-chunked",
             Mode::RsPartial => "rs-partial",
             Mode::RsSubnets => "rs-subnets",
             Mode::Hybrid => "hybrid",
             Mode::Rlnc => "rlnc",
         })
     }
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed: usize = value
+        .parse()
+        .map_err(|_| format!("{value:?} is not a positive integer"))?;
+    if parsed == 0 {
+        return Err("must be a positive integer".to_string());
+    }
+    Ok(parsed)
 }
 
 /// Shadow-compatible payload-propagation simulator.
@@ -120,6 +135,14 @@ struct Cli {
     #[arg(long, default_value_t = 4)]
     payload_chunk_recipients: usize,
 
+    /// Number of raw chunks published in `gossipsub-chunked` mode.
+    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
+    gossipsub_chunk_count: usize,
+
+    /// Lazy-gossip peer floor (`D_lazy`) in `gossipsub-chunked` mode.
+    #[arg(long, default_value_t = 0)]
+    chunked_gossip_lazy: usize,
+
     /// RLNC source-packet count `N`.
     #[arg(long, default_value_t = 10)]
     rlnc_chunks: usize,
@@ -155,6 +178,22 @@ struct Cli {
     /// Execution payload mesh minimum outbound peers (`D_out`).
     #[arg(long, default_value_t = 2)]
     execution_mesh_outbound_min: usize,
+
+    /// Raw chunked payload mesh target size (`D`).
+    #[arg(long, default_value_t = 8)]
+    chunked_mesh_n: usize,
+
+    /// Raw chunked payload mesh low-water mark (`D_low`).
+    #[arg(long, default_value_t = 6)]
+    chunked_mesh_n_low: usize,
+
+    /// Raw chunked payload mesh high-water mark (`D_high`).
+    #[arg(long, default_value_t = 12)]
+    chunked_mesh_n_high: usize,
+
+    /// Raw chunked payload mesh minimum outbound peers (`D_out`).
+    #[arg(long, default_value_t = 2)]
+    chunked_mesh_outbound_min: usize,
 
     /// Column subnet mesh target size (`D`).
     #[arg(long, default_value_t = 8)]
@@ -205,7 +244,11 @@ struct PeerEntry {
 fn gossip_tuning(cli: &Cli) -> GossipTuning {
     GossipTuning {
         flood_publish: cli.flood_publish,
-        gossip_lazy: cli.gossip_lazy,
+        gossip_lazy: if cli.mode == Mode::GossipsubChunked {
+            cli.chunked_gossip_lazy
+        } else {
+            cli.gossip_lazy
+        },
         gossip_factor: cli.gossip_factor,
         execution: MeshTuning {
             mesh_n: cli.execution_mesh_n,
@@ -224,6 +267,12 @@ fn gossip_tuning(cli: &Cli) -> GossipTuning {
             mesh_n_low: cli.partial_mesh_n_low,
             mesh_n_high: cli.partial_mesh_n_high,
             mesh_outbound_min: cli.partial_mesh_outbound_min,
+        },
+        chunked: MeshTuning {
+            mesh_n: cli.chunked_mesh_n,
+            mesh_n_low: cli.chunked_mesh_n_low,
+            mesh_n_high: cli.chunked_mesh_n_high,
+            mesh_outbound_min: cli.chunked_mesh_outbound_min,
         },
     }
 }
@@ -248,6 +297,7 @@ fn load_peer_list(path: &PathBuf) -> Result<PeerListFile, String> {
 fn mesh_topic(mode: Mode) -> libp2p::gossipsub::IdentTopic {
     match mode {
         Mode::RsPartial => payload_chunk_topic(),
+        Mode::GossipsubChunked => payload_chunked_topic(),
         Mode::RsSubnets => column_topic(0),
         Mode::Hybrid => payload_topic(),
         _ => payload_topic(),
@@ -262,6 +312,7 @@ fn primary_mesh_tuning(mode: Mode, tuning: &GossipTuning) -> MeshTuning {
     match mode {
         Mode::RsPartial => tuning.partial,
         Mode::RsSubnets => tuning.subnet,
+        Mode::GossipsubChunked => tuning.chunked,
         _ => tuning.execution,
     }
 }
@@ -325,6 +376,65 @@ fn publish_gossipsub(swarm: &mut Swarm<SimBehaviour>, payload: &[u8]) {
             bytes = payload.len(),
             hash = payload_hash(payload)
         );
+    }
+}
+
+fn publish_gossipsub_chunked(
+    swarm: &mut Swarm<SimBehaviour>,
+    payload: &[u8],
+    chunk_count: usize,
+) {
+    let chunks = match split_payload(payload, chunk_count) {
+        Ok(chunks) => chunks,
+        Err(err) => {
+            warn!(%err, "gossipsub chunk split failed");
+            return;
+        }
+    };
+    let total = chunks.len();
+    let mut published = 0usize;
+    for chunk in chunks {
+        match swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(payload_chunked_topic(), chunk.encode())
+        {
+            Ok(_) => published += 1,
+            Err(err) => warn!(%err, "gossipsub chunk publish failed"),
+        }
+    }
+    if published == total {
+        event!(
+            "payload_published",
+            bytes = payload.len(),
+            hash = payload_hash(payload),
+            chunks = total
+        );
+    } else {
+        warn!(published, total, "not all gossipsub chunks were published");
+    }
+}
+
+fn handle_gossipsub_chunked(
+    state: &mut GossipsubChunkAssembler,
+    reconstructed: &mut bool,
+    data: &[u8],
+) {
+    let Ok(chunk) = GossipsubChunkMessage::decode(data) else {
+        return;
+    };
+    let chunk_count = chunk.chunk_count;
+    let outcome = state.merge(chunk);
+    if outcome.added {
+        event!(
+            "chunk_received",
+            added = 1,
+            distinct = outcome.distinct,
+            chunks = chunk_count
+        );
+    }
+    if let Some(payload) = outcome.payload {
+        mark_reconstructed(reconstructed, &payload);
     }
 }
 
@@ -659,8 +769,10 @@ fn handle_swarm_event(
     reconstructed: &mut bool,
     payload_topic_hash: &gossipsub::TopicHash,
     chunk_topic_hash: &gossipsub::TopicHash,
+    chunked_topic_hash: &gossipsub::TopicHash,
     rs_partial: &mut Option<RsPartialState>,
     rs_subnets: &mut Option<RsSubnetState>,
+    gossipsub_chunked: &mut Option<GossipsubChunkAssembler>,
     rlnc: &mut Option<RlncState>,
 ) {
     match event {
@@ -669,6 +781,14 @@ fn handle_swarm_event(
             ..
         })) if message.topic == *payload_topic_hash => {
             mark_reconstructed(reconstructed, &message.data);
+        }
+        SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            message,
+            ..
+        })) if message.topic == *chunked_topic_hash => {
+            if let Some(state) = gossipsub_chunked.as_mut() {
+                handle_gossipsub_chunked(state, reconstructed, &message.data);
+            }
         }
         SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             message,
@@ -869,7 +989,7 @@ async fn main() {
 
     if !matches!(
         cli.mode,
-        Mode::Gossipsub | Mode::RsPartial | Mode::RsSubnets | Mode::Hybrid | Mode::Rlnc
+        Mode::Gossipsub | Mode::GossipsubChunked | Mode::RsPartial | Mode::RsSubnets | Mode::Hybrid | Mode::Rlnc
     ) {
         eprintln!("error: mode {} is not implemented yet", cli.mode);
         std::process::exit(1);
@@ -952,6 +1072,7 @@ async fn main() {
     let payload = make_payload(cli.seed, cli.payload_size_kib.saturating_mul(1024));
     let payload_topic_hash = payload_topic().hash();
     let chunk_topic_hash = payload_chunk_topic().hash();
+    let chunked_topic_hash = payload_chunked_topic().hash();
     let mut rs_partial = (cli.mode == Mode::RsPartial).then(|| RsPartialState {
         assembler: PayloadChunkAssembler::new(4),
         header_tracker: PayloadChunkHeaderTracker::new(4),
@@ -959,6 +1080,8 @@ async fn main() {
     });
     let mut rs_subnets = chunk_subscriber(cli.mode, cli.rs_subnet_subscriber)
         .then(|| RsSubnetState::new(cli.mode == Mode::Hybrid));
+    let mut gossipsub_chunked = (cli.mode == Mode::GossipsubChunked)
+        .then(GossipsubChunkAssembler::new);
     let mut rlnc_state = (cli.mode == Mode::Rlnc).then(|| {
         RlncState::new(cli.rlnc_chunks, cli.rlnc_fanout, cli.seed)
     });
@@ -982,8 +1105,10 @@ async fn main() {
                     &mut reconstructed,
                     &payload_topic_hash,
                     &chunk_topic_hash,
+                    &chunked_topic_hash,
                     &mut rs_partial,
                     &mut rs_subnets,
+                    &mut gossipsub_chunked,
                     &mut rlnc_state,
                 );
             }
@@ -1013,6 +1138,14 @@ async fn main() {
                                             &mut reconstructed,
                                         );
                                     }
+                                }
+                                Mode::GossipsubChunked => {
+                                    publish_gossipsub_chunked(
+                                        &mut swarm,
+                                        &payload,
+                                        cli.gossipsub_chunk_count,
+                                    );
+                                    mark_reconstructed(&mut reconstructed, &payload);
                                 }
                                 Mode::RsSubnets => {
                                     publish_rs_subnets(&mut swarm, &payload, &mut reconstructed);
@@ -1071,6 +1204,33 @@ mod tests {
     }
 
     #[test]
+    fn chunked_mode_defaults_to_sixty_four_chunks_and_its_lazy_gossip_setting() {
+        let cli = Cli::try_parse_from([
+            "ec-sim",
+            "--mode",
+            "gossipsub-chunked",
+            "--chunked-gossip-lazy",
+            "9",
+        ])
+        .unwrap();
+        assert_eq!(cli.mode, Mode::GossipsubChunked);
+        assert_eq!(cli.gossipsub_chunk_count, 64);
+        assert_eq!(gossip_tuning(&cli).gossip_lazy, 9);
+    }
+
+    #[test]
+    fn chunked_mode_rejects_zero_chunks() {
+        assert!(Cli::try_parse_from([
+            "ec-sim",
+            "--mode",
+            "gossipsub-chunked",
+            "--gossipsub-chunk-count",
+            "0",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn hybrid_cli_assigns_the_chunk_subscriber_role() {
         let cli =
             Cli::try_parse_from(["ec-sim", "--mode", "hybrid", "--rs-subnet-subscriber"]).unwrap();
@@ -1101,12 +1261,20 @@ mod tests {
                 mesh_n: 30,
                 ..Default::default()
             },
+            chunked: MeshTuning {
+                mesh_n: 40,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(primary_mesh_tuning(Mode::Gossipsub, &tuning), tuning.execution);
         assert_eq!(primary_mesh_tuning(Mode::Hybrid, &tuning), tuning.execution);
         assert_eq!(primary_mesh_tuning(Mode::RsSubnets, &tuning), tuning.subnet);
         assert_eq!(primary_mesh_tuning(Mode::RsPartial, &tuning), tuning.partial);
+        assert_eq!(
+            primary_mesh_tuning(Mode::GossipsubChunked, &tuning),
+            tuning.chunked
+        );
     }
 
     #[test]
@@ -1114,6 +1282,14 @@ mod tests {
         assert_eq!(
             mesh_topic(Mode::Hybrid).to_string(),
             payload_topic().to_string()
+        );
+    }
+
+    #[test]
+    fn chunked_mode_uses_its_dedicated_topic() {
+        assert_eq!(
+            mesh_topic(Mode::GossipsubChunked).to_string(),
+            payload_chunked_topic().to_string()
         );
     }
 

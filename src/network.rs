@@ -18,6 +18,9 @@ pub const TOPIC_PAYLOAD: &str = "/ec/payload/1";
 /// Reed-Solomon partial-message topic (mode `rs-partial`).
 pub const TOPIC_PAYLOAD_CHUNKS: &str = "/ec/payload_chunks/1";
 
+/// Raw normal-Gossipsub chunk topic (mode `gossipsub-chunked`).
+pub const TOPIC_PAYLOAD_CHUNKED: &str = "/ec/payload_chunked/1";
+
 /// Number of column subnets (one gossipsub topic per RS shard).
 pub const NUM_COLUMNS: usize = 128;
 
@@ -29,6 +32,11 @@ pub fn payload_topic() -> IdentTopic {
 /// Gossipsub topic for the Reed-Solomon partial-message path.
 pub fn payload_chunk_topic() -> IdentTopic {
     IdentTopic::new(TOPIC_PAYLOAD_CHUNKS)
+}
+
+/// Gossipsub topic for the raw chunked payload path.
+pub fn payload_chunked_topic() -> IdentTopic {
+    IdentTopic::new(TOPIC_PAYLOAD_CHUNKED)
 }
 
 /// Gossipsub topic for column subnet `column` (mode `rs-subnets`).
@@ -110,6 +118,8 @@ pub struct GossipTuning {
     pub subnet: MeshTuning,
     /// Mesh degrees for the RS partial-message topic.
     pub partial: MeshTuning,
+    /// Mesh degrees for the raw normal-Gossipsub chunk topic.
+    pub chunked: MeshTuning,
 }
 
 impl Default for GossipTuning {
@@ -121,6 +131,7 @@ impl Default for GossipTuning {
             execution: MeshTuning::default(),
             subnet: MeshTuning::default(),
             partial: MeshTuning::default(),
+            chunked: MeshTuning::default(),
         }
     }
 }
@@ -154,7 +165,8 @@ impl GossipTuning {
     pub fn validate(&self) -> Result<(), String> {
         Self::validate_mesh_tuple(self.execution, "execution")?;
         Self::validate_mesh_tuple(self.subnet, "subnet")?;
-        Self::validate_mesh_tuple(self.partial, "partial")
+        Self::validate_mesh_tuple(self.partial, "partial")?;
+        Self::validate_mesh_tuple(self.chunked, "chunked")
     }
 }
 
@@ -207,6 +219,7 @@ fn gossipsub_config(tuning: &GossipTuning) -> gossipsub::Config {
         .validation_mode(gossipsub::ValidationMode::Permissive);
     configure_topic_mesh(&mut builder, payload_topic().hash(), tuning.execution);
     configure_topic_mesh(&mut builder, payload_chunk_topic().hash(), tuning.partial);
+    configure_topic_mesh(&mut builder, payload_chunked_topic().hash(), tuning.chunked);
     for column in 0..NUM_COLUMNS {
         configure_topic_mesh(&mut builder, column_topic(column).hash(), tuning.subnet);
     }
@@ -398,6 +411,12 @@ mod tests {
                 mesh_n_high: 50,
                 mesh_outbound_min: 10,
             },
+            chunked: MeshTuning {
+                mesh_n: 30,
+                mesh_n_low: 20,
+                mesh_n_high: 40,
+                mesh_outbound_min: 8,
+            },
             ..Default::default()
         };
         let config = gossipsub_config(&tuning);
@@ -405,6 +424,7 @@ mod tests {
         for (topic, expected) in [
             (payload_topic(), tuning.execution),
             (payload_chunk_topic(), tuning.partial),
+            (payload_chunked_topic(), tuning.chunked),
             (column_topic(0), tuning.subnet),
             (column_topic(NUM_COLUMNS - 1), tuning.subnet),
         ] {
