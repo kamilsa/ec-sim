@@ -82,10 +82,12 @@ realtime clock (`warmup_complete`, `payload_published`, `payload_received`,
 
 Every successful run is appended to `<output.dir>/runs-history.json` and the
 self-contained `summary.html` is rewritten from that history. Click a table row
-to select a run and see its reconstruction CDF; pick a node to see that node's
-sent and received bytes. `--clean` wipes the history table so a new campaign
-starts empty. `--overlay DIR` imports extra output dirs into the same history
-(skipped if that dir + seed + `run_index` is already recorded).
+to select a run and see its reconstruction CDF, per-node sent and received byte
+distributions, and a selectable node's sent and received bytes. Supernode bars
+use a distinct color, and distribution titles include mean and median bytes.
+`--clean` wipes the history table so a new campaign starts empty. `--overlay DIR`
+imports extra output dirs into the same history (skipped if that dir + seed +
+`run_index` is already recorded).
 
 `--serve` prints time-to-50/95/99% reconstruction, a bytes summary, and serves
 the page at http://0.0.0.0:4321/summary.html. `--serve-only` rebuilds HTML from

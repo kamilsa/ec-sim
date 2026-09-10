@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from html import escape
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from statistics import median
 
 EVENT_RE = re.compile(r"EVENT kind=(\S+) t_ms=(\d+)(.*)$")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[mK]")
@@ -80,9 +81,28 @@ def load_mode(run_dir: Path) -> str:
     return str(load_run_meta(run_dir).get("mode") or run_dir.name)
 
 
+def load_supernodes(run_dir: Path) -> dict[str, bool]:
+    """Load the generated per-host supernode classification, when available."""
+    path = run_dir / "bandwidths.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        name: bool(rec.get("supernode", False))
+        for name, rec in data.items()
+        if isinstance(name, str) and isinstance(rec, dict)
+    }
+
+
 def collect_run(run_dir: Path) -> dict:
     """Load one Shadow output directory into a summary dict."""
     hosts: dict[str, dict] = {}
+    supernodes = load_supernodes(run_dir)
     for name, path in iter_host_logs(run_dir):
         text = path.read_text(errors="replace")
         rec: dict = {
@@ -91,6 +111,7 @@ def collect_run(run_dir: Path) -> dict:
             "warmup_ms": None,
             "sent": None,
             "rcvd": None,
+            "supernode": supernodes.get(name, False),
             "run_end_reconstructed": False,
         }
         for line in text.splitlines():
@@ -152,6 +173,8 @@ def collect_run(run_dir: Path) -> dict:
         "rcvd_sum": sum(rcvds) if rcvds else 0,
         "sent_mean": (sum(sents) / len(sents)) if sents else 0.0,
         "rcvd_mean": (sum(rcvds) / len(rcvds)) if rcvds else 0.0,
+        "sent_median": median(sents) if sents else 0.0,
+        "rcvd_median": median(rcvds) if rcvds else 0.0,
         "hosts": hosts,
     }
 
@@ -193,6 +216,15 @@ def _byte_value(rec: dict, *keys: str):
     return None
 
 
+def _byte_median(hosts: dict[str, dict], *keys: str) -> float:
+    values = [
+        value
+        for rec in hosts.values()
+        if isinstance(value := _byte_value(rec, *keys), (int, float))
+    ]
+    return median(values) if values else 0.0
+
+
 def normalize_snapshot(snap: dict) -> dict:
     """Map legacy tx/rx snapshot fields onto sent/rcvd."""
     hosts = {}
@@ -203,10 +235,15 @@ def normalize_snapshot(snap: dict) -> dict:
             "sent": _byte_value(rec, "sent", "tx"),
             "rcvd": _byte_value(rec, "rcvd", "rx"),
             "reconstructed_ms": rec.get("reconstructed_ms"),
+            "supernode": bool(rec.get("supernode", False)),
         }
     out = dict(snap)
     out["sent_mean"] = snap.get("sent_mean", snap.get("tx_mean", 0.0))
     out["rcvd_mean"] = snap.get("rcvd_mean", snap.get("rx_mean", 0.0))
+    out["sent_median"] = snap.get("sent_median", snap.get("tx_median",
+                                                            _byte_median(hosts, "sent")))
+    out["rcvd_median"] = snap.get("rcvd_median", snap.get("rx_median",
+                                                            _byte_median(hosts, "rcvd")))
     out["hosts"] = hosts
     return out
 
@@ -233,6 +270,7 @@ def make_snapshot(run: dict, recorded_at: str | None = None) -> dict:
             "sent": _byte_value(rec, "sent", "tx"),
             "rcvd": _byte_value(rec, "rcvd", "rx"),
             "reconstructed_ms": rec.get("reconstructed_ms"),
+            "supernode": bool(rec.get("supernode", False)),
         }
     return {
         "id": f"{ts}_{label}_{seed}_{run_index}",
@@ -249,6 +287,8 @@ def make_snapshot(run: dict, recorded_at: str | None = None) -> dict:
         "t99_ms": run["t99_ms"],
         "sent_mean": run.get("sent_mean", run.get("tx_mean", 0.0)),
         "rcvd_mean": run.get("rcvd_mean", run.get("rx_mean", 0.0)),
+        "sent_median": run.get("sent_median", run.get("tx_median", 0.0)),
+        "rcvd_median": run.get("rcvd_median", run.get("rx_median", 0.0)),
         "delays_ms": list(run.get("delays_ms") or []),
         "hosts": hosts,
     }
@@ -344,8 +384,8 @@ def write_html(runs: list[dict], out_path: Path) -> None:
         ("t50_ms", "t50_ms", False),
         ("t95_ms", "t95_ms", False),
         ("t99_ms", "t99_ms", False),
-        ("sent_mean", "sent_mean", False),
-        ("rcvd_mean", "rcvd_mean", False),
+        ("sent_median", "sent median bytes", False),
+        ("rcvd_median", "rcvd median bytes", False),
     ]
     last = len(runs) - 1
     body_rows = []
@@ -359,8 +399,8 @@ def write_html(runs: list[dict], out_path: Path) -> None:
             "t50_ms": _fmt_cell(run.get("t50_ms")),
             "t95_ms": _fmt_cell(run.get("t95_ms")),
             "t99_ms": _fmt_cell(run.get("t99_ms")),
-            "sent_mean": _fmt_cell(run.get("sent_mean", run.get("tx_mean"))),
-            "rcvd_mean": _fmt_cell(run.get("rcvd_mean", run.get("rx_mean"))),
+            "sent_median": _fmt_cell(run.get("sent_median", run.get("tx_median"))),
+            "rcvd_median": _fmt_cell(run.get("rcvd_median", run.get("rx_median"))),
         }
         selected = " selected" if i == last else ""
         cells = []
@@ -465,7 +505,13 @@ _HTML_PAGE = """<!DOCTYPE html>
       gap: 24px;
       align-items: start;
     }
-    #cdf, #bytes { width: 100%; min-height: 360px; }
+    .distributions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 24px;
+      margin-top: 24px;
+    }
+    #cdf, #bytes, #sent-distribution, #rcvd-distribution { width: 100%; min-height: 360px; }
     .bytes-panel label {
       display: block;
       color: var(--muted);
@@ -483,7 +529,7 @@ _HTML_PAGE = """<!DOCTYPE html>
       max-width: 100%;
     }
     @media (max-width: 900px) {
-      .charts { grid-template-columns: 1fr; }
+      .charts, .distributions { grid-template-columns: 1fr; }
     }
     @media (prefers-reduced-motion: reduce) {
       .run-row { transition: none; }
@@ -492,7 +538,7 @@ _HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h1>ec-sim payload propagation</h1>
-  <p class="lede">Click a run to inspect its reconstruction CDF. Pick a node to see that node's sent and received bytes.</p>
+  <p class="lede">Click a run to inspect its reconstruction CDF and per-node byte distributions. Titles list the byte mean and median. Pick a node to see its sent and received bytes.</p>
   __TABLE__
   <div class="charts">
     <div id="cdf"></div>
@@ -501,6 +547,10 @@ _HTML_PAGE = """<!DOCTYPE html>
       <select id="node-select"></select>
       <div id="bytes"></div>
     </div>
+  </div>
+  <div class="distributions">
+    <div id="sent-distribution"></div>
+    <div id="rcvd-distribution"></div>
   </div>
   <script>const RUNS = __RUNS_JSON__;</script>
   <script>__PLOTLY_JS__</script>
@@ -525,6 +575,32 @@ _HTML_PAGE = """<!DOCTYPE html>
     }
     function nodeNames(run) {
       return Object.keys((run && run.hosts) || {}).sort();
+    }
+    function byteValue(rec, field, legacyField) {
+      if (typeof rec[field] === "number") return rec[field];
+      return typeof rec[legacyField] === "number" ? rec[legacyField] : 0;
+    }
+    function meanValue(run, field, legacyField) {
+      var value = run[field + "_mean"];
+      if (typeof value === "number") return value;
+      value = run[legacyField + "_mean"];
+      return typeof value === "number" ? value : 0;
+    }
+    function medianValue(run, field, legacyField) {
+      var values = [];
+      var names = nodeNames(run);
+      for (var i = 0; i < names.length; i++) {
+        var rec = run.hosts[names[i]] || {};
+        var value = typeof rec[field] === "number" ? rec[field] : rec[legacyField];
+        if (typeof value === "number") values.push(value);
+      }
+      values.sort(function(a, b) { return a - b; });
+      var middle = Math.floor(values.length / 2);
+      if (!values.length) return 0;
+      return values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+    }
+    function formatBytes(value) {
+      return Math.round(value).toLocaleString() + " bytes";
     }
     function renderCdf(idx) {
       if (!RUNS.length) return;
@@ -551,10 +627,8 @@ _HTML_PAGE = """<!DOCTYPE html>
     }
     function renderBytes(run, name) {
       var rec = (name && run.hosts && run.hosts[name]) || {};
-      var sent = typeof rec.sent === "number" ? rec.sent
-                 : (typeof rec.tx === "number" ? rec.tx : 0);
-      var rcvd = typeof rec.rcvd === "number" ? rec.rcvd
-                 : (typeof rec.rx === "number" ? rec.rx : 0);
+      var sent = byteValue(rec, "sent", "tx");
+      var rcvd = byteValue(rec, "rcvd", "rx");
       var data = [{
         x: ["sent", "rcvd"],
         y: [sent, rcvd],
@@ -571,6 +645,54 @@ _HTML_PAGE = """<!DOCTYPE html>
       var el = document.getElementById("bytes");
       if (el && el.data) Plotly.react(el, data, layout, plotCfg);
       else Plotly.newPlot("bytes", data, layout, plotCfg);
+    }
+    function distributionTraces(run, field, legacyField) {
+      var other = {
+        x: [], y: [], type: "bar", name: "Other nodes",
+        marker: {color: "#2a6f62"},
+        hovertemplate: "%{x}<br>%{y:,.0f} bytes<extra>Other node</extra>"
+      };
+      var supernodes = {
+        x: [], y: [], type: "bar", name: "Supernodes",
+        marker: {color: "#b56a3a"},
+        hovertemplate: "%{x}<br>%{y:,.0f} bytes<extra>Supernode</extra>"
+      };
+      var names = nodeNames(run);
+      for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        var rec = run.hosts[name] || {};
+        var trace = rec.supernode === true ? supernodes : other;
+        trace.x.push(name);
+        trace.y.push(byteValue(rec, field, legacyField));
+      }
+      return [other, supernodes].filter(function(trace) { return trace.x.length; });
+    }
+    function renderDistribution(run, target, title, field, legacyField) {
+      var names = nodeNames(run);
+      var data = distributionTraces(run, field, legacyField);
+      var mean = meanValue(run, field, legacyField);
+      var median = medianValue(run, field, legacyField);
+      var layout = Object.assign({}, plotBase, {
+        margin: {t: 72, r: 24, b: 96, l: 56},
+        height: 400,
+        title: {
+          text: title + "<br><sup>mean: " + formatBytes(mean)
+                + " | median: " + formatBytes(median) + "</sup>",
+          font: {size: 16}
+        },
+        barmode: "overlay",
+        bargap: 0.08,
+        legend: {orientation: "h", x: 0, y: 1.14},
+        xaxis: {
+          categoryorder: "array", categoryarray: names, tickangle: -60,
+          tickfont: {size: 10}, automargin: true, showgrid: false, zeroline: false
+        },
+        yaxis: {title: "bytes", gridcolor: "#c9d4d0", zeroline: false},
+        showlegend: true
+      });
+      var el = document.getElementById(target);
+      if (el && el.data) Plotly.react(el, data, layout, plotCfg);
+      else Plotly.newPlot(target, data, layout, plotCfg);
     }
     function fillNodes(run) {
       var sel = document.getElementById("node-select");
@@ -592,7 +714,10 @@ _HTML_PAGE = """<!DOCTYPE html>
         row.classList.toggle("selected", Number(row.getAttribute("data-idx")) === idx);
       });
       renderCdf(idx);
-      fillNodes(RUNS[idx]);
+      var run = RUNS[idx];
+      fillNodes(run);
+      renderDistribution(run, "sent-distribution", "Sent bytes distribution", "sent", "tx");
+      renderDistribution(run, "rcvd-distribution", "Rcvd bytes distribution", "rcvd", "rx");
     }
     document.querySelectorAll(".run-row").forEach(function(row) {
       row.addEventListener("click", function() {
@@ -675,6 +800,10 @@ def _write_fixture(root: Path) -> Path:
         "seed": 42,
         "run_index": 0,
     }))
+    (run / "bandwidths.json").write_text(json.dumps({
+        f"node{i:03d}": {"supernode": i == 1}
+        for i in range(len(blocks))
+    }))
     return run
 
 
@@ -710,6 +839,12 @@ def self_test() -> None:
     assert ev["hash"] == "abcd"
     assert ev["reconstructed"] is True
     assert parse_event_line("not an event") is None
+    legacy = normalize_snapshot({"hosts": {
+        "node000": {"tx": 100, "rx": 10},
+        "node001": {"tx": 200, "rx": 30},
+    }})
+    assert legacy["sent_median"] == 150
+    assert legacy["rcvd_median"] == 20
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
@@ -722,9 +857,15 @@ def self_test() -> None:
         assert summary["t95_ms"] is None  # 95% of 4 is 4 reconstructed, only 3 did
         assert summary["sent_sum"] == 1000 + 200 + 180 + 50
         assert summary["rcvd_sum"] == 10 + 1200 + 1180 + 40
+        assert summary["sent_mean"] == 357.5
+        assert summary["rcvd_mean"] == 607.5
+        assert summary["sent_median"] == 190
+        assert summary["rcvd_median"] == 610
         assert summary["title"] == "Gossipsub baseline"
         assert summary["seed"] == 42
         assert summary["run_index"] == 0
+        assert summary["hosts"]["node001"]["supernode"] is True
+        assert summary["hosts"]["node000"]["supernode"] is False
         html = run_dir / HTML_NAME
         write_html([summary], html)
         assert html.is_file() and html.stat().st_size > 1000
@@ -736,6 +877,9 @@ def self_test() -> None:
         assert hist[0]["run_index"] == 0
         assert hist[0]["t95_ms"] is None
         assert "node000" in hist[0]["hosts"]
+        assert hist[0]["hosts"]["node001"]["supernode"] is True
+        assert hist[0]["sent_median"] == 190
+        assert hist[0]["rcvd_median"] == 610
         hist = update_history(run_dir, [], append=True, verbose=False)
         assert len(hist) == 2
         write_html(hist, html)
@@ -745,15 +889,27 @@ def self_test() -> None:
         end = text.index(";</script>", start)
         embedded = json.loads(text[start:end])
         assert len(embedded) == 2
+        assert embedded[0]["hosts"]["node001"]["supernode"] is True
+        assert embedded[0]["sent_median"] == 190
+        assert embedded[0]["rcvd_median"] == 610
         assert "data-idx" in text
         assert 'id="cdf"' in text
         assert 'id="node-select"' in text
+        assert 'id="sent-distribution"' in text
+        assert 'id="rcvd-distribution"' in text
         assert ">title<" in text
         assert "Gossipsub baseline" in text
         assert ">t95_ms<" in text
-        assert ">sent_mean<" in text
-        assert ">rcvd_mean<" in text
+        assert ">sent median bytes<" in text
+        assert ">rcvd median bytes<" in text
         assert 'x: ["sent", "rcvd"]' in text
+        assert "Sent bytes distribution" in text
+        assert "Rcvd bytes distribution" in text
+        assert "Supernodes" in text
+        assert "function meanValue" in text
+        assert "function medianValue" in text
+        assert "mean: " in text
+        assert "median: " in text
         assert "Plotly" in text
         assert "node000" in text
         assert "node003" in text
