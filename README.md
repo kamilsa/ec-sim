@@ -55,7 +55,9 @@ choose the number of chunks (default 64); when the payload is smaller than the
 requested count, it uses one non-empty chunk per payload byte. Every receiver
 needs all chunks and verifies the final SHA-256 commitment before reporting
 reconstruction. `[sim].chunked_gossip_lazy` configures its `D_lazy`; the global
-`gossip_factor` remains applicable to all Gossipsub modes.
+`gossip_factor` remains applicable to all Gossipsub modes. Set
+`[sim].chunked_send_idontwant = true` to send `IDONTWANT` to mesh peers after
+each newly accepted chunk.
 
 ## Run
 

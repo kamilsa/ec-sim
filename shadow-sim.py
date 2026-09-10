@@ -60,6 +60,7 @@ DEFAULT_WARMUP_SECS = 15
 DEFAULT_OBSERVE_SECS = 20
 DEFAULT_PAYLOAD_CHUNK_RECIPIENTS = 4
 DEFAULT_GOSSIPSUB_CHUNK_COUNT = 64
+DEFAULT_CHUNKED_SEND_IDONTWANT = False
 DEFAULT_CHUNKED_GOSSIP_LAZY = 0
 DEFAULT_RLNC_CHUNKS = 10
 DEFAULT_RLNC_FANOUT = 40
@@ -119,6 +120,13 @@ def gossip_tuning_settings(sim: dict) -> tuple[bool, int, float]:
     if isinstance(factor, bool) or not isinstance(factor, (int, float)) or factor < 0:
         die("[sim].gossip_factor must be a non-negative number")
     return flood, lazy, float(factor)
+
+
+def chunked_send_idontwant_setting(sim: dict) -> bool:
+    value = sim.get("chunked_send_idontwant", DEFAULT_CHUNKED_SEND_IDONTWANT)
+    if not isinstance(value, bool):
+        die("[sim].chunked_send_idontwant must be true or false")
+    return value
 
 
 def mesh_settings(sim: dict, profile: str) -> tuple[int, int, int, int]:
@@ -361,6 +369,8 @@ def build_args(node: Node, cfg: dict, peers: list[str],
         "--rlnc-chunks", str(_positive_int(sim, "rlnc_chunks", DEFAULT_RLNC_CHUNKS)),
         "--rlnc-fanout", str(_positive_int(sim, "rlnc_fanout", DEFAULT_RLNC_FANOUT)),
     ]
+    if chunked_send_idontwant_setting(sim):
+        parts.append("--chunked-send-idontwant")
     if node.is_builder:
         parts.append("--builder")
     if node.is_rs_subnet_subscriber:
@@ -646,6 +656,7 @@ def main() -> None:
         mesh_settings(sim_cfg, profile)
     gossip_tuning_settings(sim_cfg)
     _positive_int(sim_cfg, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT)
+    chunked_send_idontwant_setting(sim_cfg)
     _nonneg_int(sim_cfg, "chunked_gossip_lazy", DEFAULT_CHUNKED_GOSSIP_LAZY)
 
     out_dir = Path(cfg["output"]["dir"])
@@ -736,9 +747,10 @@ def main() -> None:
                                                DEFAULT_PAYLOAD_SIZE_KIB),
               "warmup_secs": _nonneg_int(sim_cfg, "warmup_secs", DEFAULT_WARMUP_SECS),
               "observe_secs": _nonneg_int(sim_cfg, "observe_secs", DEFAULT_OBSERVE_SECS),
-              "gossipsub_chunk_count": _positive_int(
-                  sim_cfg, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT),
-              "chunked_gossip_lazy": _nonneg_int(
+               "gossipsub_chunk_count": _positive_int(
+                   sim_cfg, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT),
+               "chunked_send_idontwant": chunked_send_idontwant_setting(sim_cfg),
+               "chunked_gossip_lazy": _nonneg_int(
                   sim_cfg, "chunked_gossip_lazy", DEFAULT_CHUNKED_GOSSIP_LAZY),
                "flood_publish": flood,
               "gossip_lazy": lazy,

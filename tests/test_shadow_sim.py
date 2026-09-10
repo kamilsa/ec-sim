@@ -86,12 +86,20 @@ class HybridSubscriberSelectionTests(unittest.TestCase):
             "mode": "gossipsub-chunked",
             "seed": 42,
             "gossipsub_chunk_count": 96,
+            "chunked_send_idontwant": True,
             "chunked_gossip_lazy": 7,
         }}, [])
 
         self.assertIn("--mode gossipsub-chunked", args)
         self.assertIn("--gossipsub-chunk-count 96", args)
+        self.assertIn("--chunked-send-idontwant", args)
         self.assertIn("--chunked-gossip-lazy 7", args)
+
+    def test_chunked_mode_rejects_non_boolean_idontwant_setting(self) -> None:
+        with self.assertRaises(SystemExit):
+            shadow_sim.build_args(nodes(1)[0], {"sim": {
+                "mode": "gossipsub-chunked", "seed": 42, "chunked_send_idontwant": 1,
+            }}, [])
 
     def test_chunked_mode_rejects_non_positive_chunk_count(self) -> None:
         with self.assertRaises(SystemExit):

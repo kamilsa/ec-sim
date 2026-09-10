@@ -139,6 +139,10 @@ struct Cli {
     #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
     gossipsub_chunk_count: usize,
 
+    /// Send IDONTWANT to chunk-topic mesh peers after accepting each chunk.
+    #[arg(long, default_value_t = false)]
+    chunked_send_idontwant: bool,
+
     /// Lazy-gossip peer floor (`D_lazy`) in `gossipsub-chunked` mode.
     #[arg(long, default_value_t = 0)]
     chunked_gossip_lazy: usize,
@@ -416,8 +420,10 @@ fn publish_gossipsub_chunked(
 }
 
 fn handle_gossipsub_chunked(
+    swarm: &mut Swarm<SimBehaviour>,
     state: &mut GossipsubChunkAssembler,
     reconstructed: &mut bool,
+    idontwant_message_id: Option<gossipsub::MessageId>,
     data: &[u8],
 ) {
     let Ok(chunk) = GossipsubChunkMessage::decode(data) else {
@@ -432,6 +438,13 @@ fn handle_gossipsub_chunked(
             distinct = outcome.distinct,
             chunks = chunk_count
         );
+        if let Some(message_id) = idontwant_message_id {
+            let peers = swarm
+                .behaviour_mut()
+                .gossipsub
+                .send_idontwant_to_mesh(payload_chunked_topic().hash(), [message_id]);
+            event!("chunk_idontwant_sent", peers = peers);
+        }
     }
     if let Some(payload) = outcome.payload {
         mark_reconstructed(reconstructed, &payload);
@@ -770,6 +783,7 @@ fn handle_swarm_event(
     payload_topic_hash: &gossipsub::TopicHash,
     chunk_topic_hash: &gossipsub::TopicHash,
     chunked_topic_hash: &gossipsub::TopicHash,
+    chunked_send_idontwant: bool,
     rs_partial: &mut Option<RsPartialState>,
     rs_subnets: &mut Option<RsSubnetState>,
     gossipsub_chunked: &mut Option<GossipsubChunkAssembler>,
@@ -783,11 +797,16 @@ fn handle_swarm_event(
             mark_reconstructed(reconstructed, &message.data);
         }
         SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-            message,
-            ..
+            message_id, message, ..
         })) if message.topic == *chunked_topic_hash => {
             if let Some(state) = gossipsub_chunked.as_mut() {
-                handle_gossipsub_chunked(state, reconstructed, &message.data);
+                handle_gossipsub_chunked(
+                    swarm,
+                    state,
+                    reconstructed,
+                    chunked_send_idontwant.then_some(message_id),
+                    &message.data,
+                );
             }
         }
         SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -1106,6 +1125,7 @@ async fn main() {
                     &payload_topic_hash,
                     &chunk_topic_hash,
                     &chunked_topic_hash,
+                    cli.chunked_send_idontwant,
                     &mut rs_partial,
                     &mut rs_subnets,
                     &mut gossipsub_chunked,
@@ -1215,7 +1235,20 @@ mod tests {
         .unwrap();
         assert_eq!(cli.mode, Mode::GossipsubChunked);
         assert_eq!(cli.gossipsub_chunk_count, 64);
+        assert!(!cli.chunked_send_idontwant);
         assert_eq!(gossip_tuning(&cli).gossip_lazy, 9);
+    }
+
+    #[test]
+    fn chunked_mode_parses_idontwant_flag() {
+        let cli = Cli::try_parse_from([
+            "ec-sim",
+            "--mode",
+            "gossipsub-chunked",
+            "--chunked-send-idontwant",
+        ])
+        .unwrap();
+        assert!(cli.chunked_send_idontwant);
     }
 
     #[test]

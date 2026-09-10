@@ -23,6 +23,7 @@ observe_secs = 20             # window after publish before every node exits
 # 60/80/90 with 18 outbound peers. Validated at 128/128 reconstructed, t95=856 ms.
 payload_chunk_recipients = 3  # rs-partial: mesh peers seeded per shard
 gossipsub_chunk_count = 64    # gossipsub-chunked: raw payload chunks
+chunked_send_idontwant = false # gossipsub-chunked: notify mesh peers after each accepted chunk
 chunked_gossip_lazy = 0       # gossipsub-chunked: D_lazy (other modes use gossip_lazy)
 rlnc_chunks = 15              # RLNC source-packet count N
 rlnc_fanout = 18              # RLNC push degree D (independent of gossipsub meshes)
