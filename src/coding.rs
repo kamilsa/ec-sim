@@ -15,6 +15,57 @@ pub const PAYLOAD_PARITY_SHARDS: usize = 64;
 /// Total shards (data + parity) propagated over the chunk / column topics.
 pub const PAYLOAD_TOTAL_SHARDS: usize = PAYLOAD_DATA_SHARDS + PAYLOAD_PARITY_SHARDS;
 
+/// Largest total shard count representable over GF(2⁸): `reed_solomon_erasure`
+/// rejects `data + parity > 256`.
+pub const MAX_TOTAL_SHARDS: usize = 256;
+
+/// Reed-Solomon rate for one payload: `data` systematic shards extended to
+/// `total`, reconstructable from any `data` of them.
+///
+/// `rs-partial`, `rs-subnets`, and `hybrid` always use [`RsParams::DEFAULT`];
+/// only `gossipsub-rs` exposes this as configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RsParams {
+    pub data: usize,
+    pub total: usize,
+}
+
+impl RsParams {
+    /// The 64-of-128 rate every non-configurable mode uses.
+    pub const DEFAULT: Self = Self {
+        data: PAYLOAD_DATA_SHARDS,
+        total: PAYLOAD_TOTAL_SHARDS,
+    };
+
+    pub fn new(data: usize, total: usize) -> Result<Self, PayloadCodingError> {
+        let params = Self { data, total };
+        params.validate()?;
+        Ok(params)
+    }
+
+    pub fn parity(&self) -> usize {
+        self.total.saturating_sub(self.data)
+    }
+
+    /// Reject rates Reed-Solomon cannot represent: at least one data shard, at
+    /// least one parity shard, and at most [`MAX_TOTAL_SHARDS`] in total.
+    pub fn validate(&self) -> Result<(), PayloadCodingError> {
+        if self.data == 0 || self.total <= self.data || self.total > MAX_TOTAL_SHARDS {
+            return Err(PayloadCodingError::InvalidRsParams {
+                data: self.data,
+                total: self.total,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for RsParams {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Errors from encoding or decoding a payload's shards.
 #[derive(Debug)]
 pub enum PayloadCodingError {
@@ -23,6 +74,7 @@ pub enum PayloadCodingError {
     InvalidShardIndex { idx: usize },
     InconsistentShardLength { expected: usize, got: usize },
     HashMismatch,
+    InvalidRsParams { data: usize, total: usize },
 }
 
 impl fmt::Display for PayloadCodingError {
@@ -31,9 +83,13 @@ impl fmt::Display for PayloadCodingError {
             Self::EmptyPayload => write!(f, "cannot encode an empty payload"),
             Self::Rs(e) => write!(f, "reed-solomon-erasure: {e}"),
             Self::InvalidShardIndex { idx } => {
+                write!(f, "shard index {idx} out of range")
+            }
+            Self::InvalidRsParams { data, total } => {
                 write!(
                     f,
-                    "shard index {idx} out of range (total = {PAYLOAD_TOTAL_SHARDS})"
+                    "invalid reed-solomon rate {data}-of-{total}: need \
+                     1 <= data < total <= {MAX_TOTAL_SHARDS}"
                 )
             }
             Self::InconsistentShardLength { expected, got } => {
@@ -70,17 +126,21 @@ pub type EncodedPayloadShards = (usize, [u8; 32], Vec<Vec<u8>>);
 /// Split `payload` into [`PAYLOAD_DATA_SHARDS`] zero-padded data shards and
 /// Reed-Solomon-extend them to [`PAYLOAD_TOTAL_SHARDS`] total shards.
 pub fn encode_payload_shards(payload: &[u8]) -> Result<EncodedPayloadShards, PayloadCodingError> {
+    encode_payload_shards_with(payload, RsParams::DEFAULT)
+}
+
+/// [`encode_payload_shards`] at an explicit Reed-Solomon rate.
+pub fn encode_payload_shards_with(
+    payload: &[u8],
+    params: RsParams,
+) -> Result<EncodedPayloadShards, PayloadCodingError> {
+    params.validate()?;
     if payload.is_empty() {
         return Err(PayloadCodingError::EmptyPayload);
     }
-    let shard_len = payload.len().div_ceil(PAYLOAD_DATA_SHARDS);
-    let rs = reed_solomon_erasure::galois_8::ReedSolomon::new(
-        PAYLOAD_DATA_SHARDS,
-        PAYLOAD_PARITY_SHARDS,
-    )?;
-    let mut shards: Vec<Vec<u8>> = (0..PAYLOAD_TOTAL_SHARDS)
-        .map(|_| vec![0u8; shard_len])
-        .collect();
+    let shard_len = payload.len().div_ceil(params.data);
+    let rs = reed_solomon_erasure::galois_8::ReedSolomon::new(params.data, params.parity())?;
+    let mut shards: Vec<Vec<u8>> = (0..params.total).map(|_| vec![0u8; shard_len]).collect();
     for (chunk, shard) in payload.chunks(shard_len).zip(shards.iter_mut()) {
         shard[..chunk.len()].copy_from_slice(chunk);
     }
@@ -96,13 +156,22 @@ pub fn decode_payload(
     payload_hash: &[u8; 32],
     shards: &[(usize, Vec<u8>)],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), PayloadCodingError> {
-    let rs = reed_solomon_erasure::galois_8::ReedSolomon::new(
-        PAYLOAD_DATA_SHARDS,
-        PAYLOAD_PARITY_SHARDS,
-    )?;
-    let mut buckets: Vec<Option<Vec<u8>>> = vec![None; PAYLOAD_TOTAL_SHARDS];
+    decode_payload_with(payload_len, shard_len, payload_hash, shards, RsParams::DEFAULT)
+}
+
+/// [`decode_payload`] at an explicit Reed-Solomon rate.
+pub fn decode_payload_with(
+    payload_len: usize,
+    shard_len: usize,
+    payload_hash: &[u8; 32],
+    shards: &[(usize, Vec<u8>)],
+    params: RsParams,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), PayloadCodingError> {
+    params.validate()?;
+    let rs = reed_solomon_erasure::galois_8::ReedSolomon::new(params.data, params.parity())?;
+    let mut buckets: Vec<Option<Vec<u8>>> = vec![None; params.total];
     for (idx, data) in shards {
-        if *idx >= PAYLOAD_TOTAL_SHARDS {
+        if *idx >= params.total {
             return Err(PayloadCodingError::InvalidShardIndex { idx: *idx });
         }
         if data.len() != shard_len {
@@ -115,15 +184,15 @@ pub fn decode_payload(
     }
     rs.reconstruct(&mut buckets)?;
 
-    let mut full_shards = Vec::with_capacity(PAYLOAD_TOTAL_SHARDS);
+    let mut full_shards = Vec::with_capacity(params.total);
     for slot in buckets {
         full_shards.push(slot.ok_or(PayloadCodingError::Rs(
             reed_solomon_erasure::Error::TooFewShardsPresent,
         ))?);
     }
 
-    let mut out = Vec::with_capacity(PAYLOAD_DATA_SHARDS * shard_len);
-    for shard in full_shards.iter().take(PAYLOAD_DATA_SHARDS) {
+    let mut out = Vec::with_capacity(params.data * shard_len);
+    for shard in full_shards.iter().take(params.data) {
         out.extend_from_slice(shard);
     }
     if payload_len > out.len() {
@@ -238,6 +307,81 @@ mod tests {
             .map(|(i, s)| (i, s.clone()))
             .collect();
         assert!(decode_payload(payload.len(), shard_len, &hash, &indexed).is_err());
+    }
+
+    #[test]
+    fn custom_rate_round_trips_from_exactly_data_shards() {
+        let params = RsParams::new(32, 48).unwrap();
+        assert_eq!(params.parity(), 16);
+        let payload: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+        let (shard_len, hash, shards) = encode_payload_shards_with(&payload, params).unwrap();
+        assert_eq!(shards.len(), 48);
+        assert_eq!(shard_len, payload.len().div_ceil(32));
+
+        // Drop the 32 systematic shards entirely: parity alone must decode.
+        let kept: Vec<(usize, Vec<u8>)> = shards
+            .iter()
+            .enumerate()
+            .skip(16)
+            .take(32)
+            .map(|(i, s)| (i, s.clone()))
+            .collect();
+        let (recovered, full) =
+            decode_payload_with(payload.len(), shard_len, &hash, &kept, params).unwrap();
+        assert_eq!(recovered, payload);
+        assert_eq!(full.len(), 48);
+    }
+
+    #[test]
+    fn custom_rate_fails_one_shard_below_the_threshold() {
+        let params = RsParams::new(32, 48).unwrap();
+        let payload = vec![9u8; 4_096];
+        let (shard_len, hash, shards) = encode_payload_shards_with(&payload, params).unwrap();
+        let kept: Vec<(usize, Vec<u8>)> = shards
+            .iter()
+            .enumerate()
+            .take(31)
+            .map(|(i, s)| (i, s.clone()))
+            .collect();
+        assert!(decode_payload_with(payload.len(), shard_len, &hash, &kept, params).is_err());
+    }
+
+    #[test]
+    fn default_helpers_delegate_to_the_default_rate() {
+        let payload = vec![5u8; 2_048];
+        let from_default = encode_payload_shards(&payload).unwrap();
+        let explicit = encode_payload_shards_with(&payload, RsParams::DEFAULT).unwrap();
+        assert_eq!(from_default, explicit);
+        assert_eq!(RsParams::default(), RsParams::DEFAULT);
+        assert_eq!(RsParams::DEFAULT.parity(), PAYLOAD_PARITY_SHARDS);
+    }
+
+    #[test]
+    fn invalid_rates_are_rejected() {
+        for (data, total) in [
+            (0, 10),                     // no data shards
+            (10, 10),                    // no parity shards
+            (10, 9),                     // total below data
+            (1, MAX_TOTAL_SHARDS + 1),   // beyond GF(2^8)
+        ] {
+            assert!(
+                matches!(
+                    RsParams::new(data, total),
+                    Err(PayloadCodingError::InvalidRsParams { .. })
+                ),
+                "{data}-of-{total} must be rejected"
+            );
+        }
+        assert!(RsParams::new(1, MAX_TOTAL_SHARDS).is_ok());
+        // The GF(2^8) bound is exactly what reed-solomon-erasure enforces.
+        assert!(encode_payload_shards_with(
+            &[1u8; 64],
+            RsParams {
+                data: 1,
+                total: MAX_TOTAL_SHARDS + 1
+            }
+        )
+        .is_err());
     }
 
     #[test]

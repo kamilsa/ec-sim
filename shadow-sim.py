@@ -43,13 +43,22 @@ CL_PORT = 9000  # libp2p QUIC (UDP)
 EC_SIM_BIN_DOCKER = "/opt/ecsim/ec-sim"
 EC_SIM_BIN_NATIVE = str(REPO_ROOT / "target" / "release" / "ec-sim")
 
-MODES = {"gossipsub", "gossipsub-chunked", "rs-partial", "rs-subnets", "hybrid", "rlnc"}
+MODES = {"gossipsub", "gossipsub-chunked", "gossipsub-rs", "rs-partial", "rs-subnets",
+         "chunk-subnets", "hybrid", "rlnc"}
 HYBRID_SELECTIONS = {"fraction", "supernodes"}
 DEFAULT_MODE = "gossipsub"
 DEFAULT_FLOOD_PUBLISH = False
 DEFAULT_GOSSIP_LAZY = 0
 DEFAULT_GOSSIP_FACTOR = 0.0
-MESH_PROFILES = ("execution", "chunked", "subnet", "partial")
+MESH_PROFILES = ("execution", "chunked", "subnet", "partial", "chunk_subnet", "gossipsub_rs")
+# Chunk subnets each get their own per-topic mesh entry; keep in sync with
+# MAX_CHUNK_SUBNETS in src/network.rs.
+MAX_CHUNK_SUBNETS = 512
+# Reed-Solomon over GF(2^8) cannot exceed 256 shards; keep in sync with
+# MAX_TOTAL_SHARDS in src/coding.rs.
+MAX_TOTAL_SHARDS = 256
+DEFAULT_GOSSIPSUB_RS_DATA_SHARDS = 64
+DEFAULT_GOSSIPSUB_RS_TOTAL_SHARDS = 128
 LEGACY_MESH_KEYS = ("mesh_n", "mesh_n_low", "mesh_n_high", "mesh_outbound_min")
 DEFAULT_MESH_N = 8
 DEFAULT_MESH_N_LOW = 6
@@ -127,6 +136,32 @@ def chunked_send_idontwant_setting(sim: dict) -> bool:
     if not isinstance(value, bool):
         die("[sim].chunked_send_idontwant must be true or false")
     return value
+
+
+def gossipsub_chunk_count_setting(sim: dict) -> int:
+    """Chunk count shared by `gossipsub-chunked` and `chunk-subnets`.
+
+    `chunk-subnets` turns every chunk into its own gossipsub topic, so it is
+    additionally capped by the per-topic mesh budget.
+    """
+    count = _positive_int(sim, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT)
+    if mode_setting(sim) == "chunk-subnets" and count > MAX_CHUNK_SUBNETS:
+        die(f"[sim].gossipsub_chunk_count must be at most {MAX_CHUNK_SUBNETS} in "
+            f'mode "chunk-subnets", got {count}')
+    return count
+
+
+def gossipsub_rs_shard_settings(sim: dict) -> tuple[int, int]:
+    """Reed-Solomon rate for `gossipsub-rs`, mirroring RsParams::validate."""
+    data = _positive_int(sim, "gossipsub_rs_data_shards", DEFAULT_GOSSIPSUB_RS_DATA_SHARDS)
+    total = _positive_int(sim, "gossipsub_rs_total_shards", DEFAULT_GOSSIPSUB_RS_TOTAL_SHARDS)
+    if total <= data:
+        die("[sim].gossipsub_rs_total_shards must be greater than "
+            f"[sim].gossipsub_rs_data_shards, got {total} <= {data}")
+    if total > MAX_TOTAL_SHARDS:
+        die("[sim].gossipsub_rs_total_shards must be at most "
+            f"{MAX_TOTAL_SHARDS} (reed-solomon over GF(2^8)), got {total}")
+    return data, total
 
 
 def mesh_settings(sim: dict, profile: str) -> tuple[int, int, int, int]:
@@ -362,13 +397,15 @@ def build_args(node: Node, cfg: dict, peers: list[str],
         "--observe-secs", str(_nonneg_int(sim, "observe_secs", DEFAULT_OBSERVE_SECS)),
         "--payload-chunk-recipients",
         str(_positive_int(sim, "payload_chunk_recipients", DEFAULT_PAYLOAD_CHUNK_RECIPIENTS)),
-        "--gossipsub-chunk-count",
-        str(_positive_int(sim, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT)),
+        "--gossipsub-chunk-count", str(gossipsub_chunk_count_setting(sim)),
         "--chunked-gossip-lazy",
         str(_nonneg_int(sim, "chunked_gossip_lazy", DEFAULT_CHUNKED_GOSSIP_LAZY)),
         "--rlnc-chunks", str(_positive_int(sim, "rlnc_chunks", DEFAULT_RLNC_CHUNKS)),
         "--rlnc-fanout", str(_positive_int(sim, "rlnc_fanout", DEFAULT_RLNC_FANOUT)),
     ]
+    rs_data, rs_total = gossipsub_rs_shard_settings(sim)
+    parts += ["--gossipsub-rs-data-shards", str(rs_data),
+              "--gossipsub-rs-total-shards", str(rs_total)]
     if chunked_send_idontwant_setting(sim):
         parts.append("--chunked-send-idontwant")
     if node.is_builder:
@@ -383,10 +420,12 @@ def build_args(node: Node, cfg: dict, peers: list[str],
     parts += ["--gossip-lazy", str(lazy), "--gossip-factor", str(factor)]
     for profile in MESH_PROFILES:
         mesh_n, mesh_low, mesh_high, mesh_outbound = mesh_settings(sim, profile)
-        parts += [f"--{profile}-mesh-n", str(mesh_n),
-                  f"--{profile}-mesh-n-low", str(mesh_low),
-                  f"--{profile}-mesh-n-high", str(mesh_high),
-                  f"--{profile}-mesh-outbound-min", str(mesh_outbound)]
+        # Config keys use underscores (chunk_subnet_mesh_n); clap flags use dashes.
+        flag = profile.replace("_", "-")
+        parts += [f"--{flag}-mesh-n", str(mesh_n),
+                  f"--{flag}-mesh-n-low", str(mesh_low),
+                  f"--{flag}-mesh-n-high", str(mesh_high),
+                  f"--{flag}-mesh-outbound-min", str(mesh_outbound)]
     for p in peers:
         parts += ["--peer", p]
     return " ".join(parts)
@@ -655,7 +694,8 @@ def main() -> None:
     for profile in MESH_PROFILES:
         mesh_settings(sim_cfg, profile)
     gossip_tuning_settings(sim_cfg)
-    _positive_int(sim_cfg, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT)
+    gossipsub_chunk_count_setting(sim_cfg)
+    gossipsub_rs_shard_settings(sim_cfg)
     chunked_send_idontwant_setting(sim_cfg)
     _nonneg_int(sim_cfg, "chunked_gossip_lazy", DEFAULT_CHUNKED_GOSSIP_LAZY)
 
@@ -730,6 +770,7 @@ def main() -> None:
             native_run_shadow(out_dir)
 
         flood, lazy, factor = gossip_tuning_settings(sim_cfg)
+        rs_data, rs_total = gossipsub_rs_shard_settings(sim_cfg)
         mesh_meta = {}
         for profile in MESH_PROFILES:
             mesh_n, mesh_low, mesh_high, mesh_outbound = mesh_settings(sim_cfg, profile)
@@ -747,8 +788,9 @@ def main() -> None:
                                                DEFAULT_PAYLOAD_SIZE_KIB),
               "warmup_secs": _nonneg_int(sim_cfg, "warmup_secs", DEFAULT_WARMUP_SECS),
               "observe_secs": _nonneg_int(sim_cfg, "observe_secs", DEFAULT_OBSERVE_SECS),
-               "gossipsub_chunk_count": _positive_int(
-                   sim_cfg, "gossipsub_chunk_count", DEFAULT_GOSSIPSUB_CHUNK_COUNT),
+               "gossipsub_chunk_count": gossipsub_chunk_count_setting(sim_cfg),
+               "gossipsub_rs_data_shards": rs_data,
+               "gossipsub_rs_total_shards": rs_total,
                "chunked_send_idontwant": chunked_send_idontwant_setting(sim_cfg),
                "chunked_gossip_lazy": _nonneg_int(
                   sim_cfg, "chunked_gossip_lazy", DEFAULT_CHUNKED_GOSSIP_LAZY),

@@ -14,14 +14,16 @@ mod rlnc;
 mod rlnc_proto;
 
 use crate::coding::{
-    decode_payload, encode_payload_shards, ColumnShardMessage, PAYLOAD_DATA_SHARDS,
-    PAYLOAD_TOTAL_SHARDS,
+    decode_payload_with, encode_payload_shards, encode_payload_shards_with, ColumnShardMessage,
+    RsParams, PAYLOAD_DATA_SHARDS, PAYLOAD_TOTAL_SHARDS,
 };
 use crate::events::hex_bytes;
 use crate::network::{
-    build_swarm, column_from_topic, column_topic, content_message_id_for, dial_peers, gossip_byte_totals, keypair_from_seed,
-    mesh_peer_count, payload_chunk_topic, payload_chunked_topic, payload_topic, subscribe_partial, GossipTuning, MeshTuning,
-    SimBehaviour, SimBehaviourEvent, NUM_COLUMNS,
+    build_swarm, chunk_subnet_from_topic, chunk_subnet_topic, column_from_topic, column_topic,
+    content_message_id_for, dial_peers, gossip_byte_totals, keypair_from_seed,
+    mesh_peer_count, payload_chunk_topic, payload_chunked_topic, payload_rs_topic, payload_topic,
+    subscribe_partial, GossipTuning, MeshTuning,
+    SimBehaviour, SimBehaviourEvent, MAX_CHUNK_SUBNETS, NUM_COLUMNS,
 };
 use crate::gossipsub_chunks::{split_payload, GossipsubChunkAssembler, GossipsubChunkMessage};
 use crate::payload_chunks::{
@@ -55,6 +57,10 @@ enum Mode {
     RsPartial,
     #[value(name = "rs-subnets")]
     RsSubnets,
+    #[value(name = "chunk-subnets")]
+    ChunkSubnets,
+    #[value(name = "gossipsub-rs")]
+    GossipsubRs,
     Hybrid,
     Rlnc,
 }
@@ -66,6 +72,8 @@ impl std::fmt::Display for Mode {
             Mode::GossipsubChunked => "gossipsub-chunked",
             Mode::RsPartial => "rs-partial",
             Mode::RsSubnets => "rs-subnets",
+            Mode::ChunkSubnets => "chunk-subnets",
+            Mode::GossipsubRs => "gossipsub-rs",
             Mode::Hybrid => "hybrid",
             Mode::Rlnc => "rlnc",
         })
@@ -230,6 +238,46 @@ struct Cli {
     /// Partial-message mesh minimum outbound peers (`D_out`).
     #[arg(long, default_value_t = 2)]
     partial_mesh_outbound_min: usize,
+
+    /// Raw chunk subnet mesh target size (`D`).
+    #[arg(long, default_value_t = 8)]
+    chunk_subnet_mesh_n: usize,
+
+    /// Raw chunk subnet mesh low-water mark (`D_low`).
+    #[arg(long, default_value_t = 6)]
+    chunk_subnet_mesh_n_low: usize,
+
+    /// Raw chunk subnet mesh high-water mark (`D_high`).
+    #[arg(long, default_value_t = 12)]
+    chunk_subnet_mesh_n_high: usize,
+
+    /// Raw chunk subnet mesh minimum outbound peers (`D_out`).
+    #[arg(long, default_value_t = 2)]
+    chunk_subnet_mesh_outbound_min: usize,
+
+    /// Single-topic RS shard mesh target size (`D`).
+    #[arg(long, default_value_t = 8)]
+    gossipsub_rs_mesh_n: usize,
+
+    /// Single-topic RS shard mesh low-water mark (`D_low`).
+    #[arg(long, default_value_t = 6)]
+    gossipsub_rs_mesh_n_low: usize,
+
+    /// Single-topic RS shard mesh high-water mark (`D_high`).
+    #[arg(long, default_value_t = 12)]
+    gossipsub_rs_mesh_n_high: usize,
+
+    /// Single-topic RS shard mesh minimum outbound peers (`D_out`).
+    #[arg(long, default_value_t = 2)]
+    gossipsub_rs_mesh_outbound_min: usize,
+
+    /// `gossipsub-rs`: systematic shards a payload is split into.
+    #[arg(long, default_value_t = PAYLOAD_DATA_SHARDS, value_parser = parse_positive_usize)]
+    gossipsub_rs_data_shards: usize,
+
+    /// `gossipsub-rs`: total shards after Reed-Solomon extension.
+    #[arg(long, default_value_t = PAYLOAD_TOTAL_SHARDS, value_parser = parse_positive_usize)]
+    gossipsub_rs_total_shards: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +326,34 @@ fn gossip_tuning(cli: &Cli) -> GossipTuning {
             mesh_n_high: cli.chunked_mesh_n_high,
             mesh_outbound_min: cli.chunked_mesh_outbound_min,
         },
+        chunk_subnet: MeshTuning {
+            mesh_n: cli.chunk_subnet_mesh_n,
+            mesh_n_low: cli.chunk_subnet_mesh_n_low,
+            mesh_n_high: cli.chunk_subnet_mesh_n_high,
+            mesh_outbound_min: cli.chunk_subnet_mesh_outbound_min,
+        },
+        gossipsub_rs: MeshTuning {
+            mesh_n: cli.gossipsub_rs_mesh_n,
+            mesh_n_low: cli.gossipsub_rs_mesh_n_low,
+            mesh_n_high: cli.gossipsub_rs_mesh_n_high,
+            mesh_outbound_min: cli.gossipsub_rs_mesh_outbound_min,
+        },
+        // Only chunk-subnets runs configure these topics; other modes would pay
+        // for per-topic mesh entries they never subscribe to.
+        chunk_subnet_count: if cli.mode == Mode::ChunkSubnets {
+            cli.gossipsub_chunk_count
+        } else {
+            0
+        },
+    }
+}
+
+/// Reed-Solomon rate for `gossipsub-rs`. Validated once at startup, so the
+/// unchecked construction here cannot produce an invalid rate at runtime.
+fn gossipsub_rs_params(cli: &Cli) -> RsParams {
+    RsParams {
+        data: cli.gossipsub_rs_data_shards,
+        total: cli.gossipsub_rs_total_shards,
     }
 }
 
@@ -303,6 +379,8 @@ fn mesh_topic(mode: Mode) -> libp2p::gossipsub::IdentTopic {
         Mode::RsPartial => payload_chunk_topic(),
         Mode::GossipsubChunked => payload_chunked_topic(),
         Mode::RsSubnets => column_topic(0),
+        Mode::ChunkSubnets => chunk_subnet_topic(0),
+        Mode::GossipsubRs => payload_rs_topic(),
         Mode::Hybrid => payload_topic(),
         _ => payload_topic(),
     }
@@ -316,6 +394,8 @@ fn primary_mesh_tuning(mode: Mode, tuning: &GossipTuning) -> MeshTuning {
     match mode {
         Mode::RsPartial => tuning.partial,
         Mode::RsSubnets => tuning.subnet,
+        Mode::ChunkSubnets => tuning.chunk_subnet,
+        Mode::GossipsubRs => tuning.gossipsub_rs,
         Mode::GossipsubChunked => tuning.chunked,
         _ => tuning.execution,
     }
@@ -444,6 +524,84 @@ fn handle_gossipsub_chunked(
                 .gossipsub
                 .send_idontwant_to_mesh(payload_chunked_topic().hash(), [message_id]);
             event!("chunk_idontwant_sent", peers = peers);
+        }
+    }
+    if let Some(payload) = outcome.payload {
+        mark_reconstructed(reconstructed, &payload);
+    }
+}
+
+/// Publish each raw chunk on its own subnet topic (mode `chunk-subnets`).
+///
+/// Unlike `rs-subnets` there is no erasure coding: every chunk is required, so a
+/// receiver reconstructs only once all of them arrive.
+fn publish_chunk_subnets(swarm: &mut Swarm<SimBehaviour>, payload: &[u8], chunk_count: usize) {
+    let chunks = match split_payload(payload, chunk_count) {
+        Ok(chunks) => chunks,
+        Err(err) => {
+            warn!(%err, "chunk-subnets split failed");
+            return;
+        }
+    };
+    let total = chunks.len();
+    let mut published = 0usize;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        match swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(chunk_subnet_topic(index), chunk.encode())
+        {
+            Ok(_) => published += 1,
+            Err(err) => warn!(subnet = index, %err, "chunk-subnets publish failed"),
+        }
+    }
+    if published == total {
+        event!(
+            "payload_published",
+            bytes = payload.len(),
+            hash = payload_hash(payload),
+            chunks = total
+        );
+    } else {
+        warn!(published, total, "not all chunk subnets were published");
+    }
+}
+
+fn handle_chunk_subnets(
+    swarm: &mut Swarm<SimBehaviour>,
+    state: &mut GossipsubChunkAssembler,
+    reconstructed: &mut bool,
+    idontwant_message_id: Option<gossipsub::MessageId>,
+    topic: &str,
+    data: &[u8],
+) {
+    let Some(subnet) = chunk_subnet_from_topic(topic) else {
+        return;
+    };
+    let Ok(chunk) = GossipsubChunkMessage::decode(data) else {
+        return;
+    };
+    // A chunk only counts on the subnet that carries its index, so a misrouted
+    // or mislabelled message cannot be merged.
+    if chunk.index as usize != subnet {
+        return;
+    }
+    let chunk_count = chunk.chunk_count;
+    let outcome = state.merge(chunk);
+    if outcome.added {
+        event!(
+            "chunk_received",
+            subnet = subnet,
+            added = 1,
+            distinct = outcome.distinct,
+            chunks = chunk_count
+        );
+        if let Some(message_id) = idontwant_message_id {
+            let peers = swarm
+                .behaviour_mut()
+                .gossipsub
+                .send_idontwant_to_mesh(chunk_subnet_topic(subnet).hash(), [message_id]);
+            event!("chunk_idontwant_sent", subnet = subnet, peers = peers);
         }
     }
     if let Some(payload) = outcome.payload {
@@ -587,7 +745,13 @@ fn handle_rs_partial(
     }
 }
 
+/// Collected RS shards for one payload.
+///
+/// Shared by `rs-subnets` / `hybrid` (one topic per shard, always the default
+/// 64-of-128 rate) and `gossipsub-rs` (all shards on one topic, configurable
+/// rate). Only the shard *index source* and the IDONTWANT topic layout differ.
 struct RsSubnetState {
+    params: RsParams,
     shards: Vec<Option<Vec<u8>>>,
     payload_len: Option<usize>,
     shard_len: Option<usize>,
@@ -598,8 +762,13 @@ struct RsSubnetState {
 
 impl RsSubnetState {
     fn new(bridge_payload: bool) -> Self {
+        Self::with_params(RsParams::DEFAULT, bridge_payload)
+    }
+
+    fn with_params(params: RsParams, bridge_payload: bool) -> Self {
         Self {
-            shards: vec![None; PAYLOAD_TOTAL_SHARDS],
+            params,
+            shards: vec![None; params.total],
             payload_len: None,
             shard_len: None,
             payload_hash: None,
@@ -610,6 +779,25 @@ impl RsSubnetState {
 
     fn distinct(&self) -> usize {
         self.shards.iter().filter(|s| s.is_some()).count()
+    }
+}
+
+/// Where the shards of a payload live, which decides how a reconstructing node
+/// addresses its IDONTWANT notifications.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShardTopics {
+    /// One topic per shard index (`rs-subnets`, `hybrid`).
+    PerColumn,
+    /// Every shard on a single topic (`gossipsub-rs`).
+    Single,
+}
+
+impl ShardTopics {
+    fn topic_for(&self, index: usize) -> gossipsub::TopicHash {
+        match self {
+            Self::PerColumn => column_topic(index).hash(),
+            Self::Single => payload_rs_topic().hash(),
+        }
     }
 }
 
@@ -678,16 +866,22 @@ fn publish_hybrid(swarm: &mut Swarm<SimBehaviour>, payload: &[u8], reconstructed
     mark_reconstructed(reconstructed, payload);
 }
 
+/// Tell mesh peers to stop sending shards this node can now derive itself.
+///
+/// A reconstructing node regenerates the full shard set, so it can suppress
+/// shards it never actually received. Per-column layouts need one call per
+/// topic; a single-topic layout sends every id in one IDONTWANT per mesh peer.
 fn send_reconstructed_chunk_idontwants(
     swarm: &mut Swarm<SimBehaviour>,
+    layout: ShardTopics,
     payload_len: usize,
     shard_len: usize,
     payload_hash: [u8; 32],
     shards: &[Vec<u8>],
 ) -> usize {
-    let mut peers = 0;
+    let mut batches: Vec<(gossipsub::TopicHash, Vec<gossipsub::MessageId>)> = Vec::new();
     for (index, data) in shards.iter().enumerate() {
-        let topic = column_topic(index).hash();
+        let topic = layout.topic_for(index);
         let message = ColumnShardMessage {
             index: index as u16,
             payload_len: payload_len as u64,
@@ -696,45 +890,51 @@ fn send_reconstructed_chunk_idontwants(
             data: data.clone(),
         };
         let message_id = content_message_id_for(&topic, &message.encode());
+        match batches.last_mut() {
+            Some((last, ids)) if *last == topic => ids.push(message_id),
+            _ => batches.push((topic, vec![message_id])),
+        }
+    }
+    let mut peers = 0;
+    for (topic, ids) in batches {
         peers += swarm
             .behaviour_mut()
             .gossipsub
-            .send_idontwant_to_mesh(topic, [message_id]);
+            .send_idontwant_to_mesh(topic, ids);
     }
     peers
 }
 
-fn handle_rs_subnets(
-    swarm: &mut Swarm<SimBehaviour>,
+/// Merge one shard. Returns the distinct-shard count when the shard was new,
+/// or `None` for a duplicate, an out-of-range index, or a shard whose declared
+/// index disagrees with where it arrived.
+fn merge_rs_shard(
     state: &mut RsSubnetState,
-    reconstructed: &mut bool,
-    topic: &str,
-    data: &[u8],
-) {
-    let Some(column) = column_from_topic(topic) else {
-        return;
-    };
-    let Ok(msg) = ColumnShardMessage::decode(data) else {
-        return;
-    };
-    if msg.index as usize != column || column >= PAYLOAD_TOTAL_SHARDS {
-        return;
+    index: usize,
+    msg: ColumnShardMessage,
+) -> Option<usize> {
+    if index >= state.params.total || msg.index as usize != index {
+        return None;
     }
-    if state.shards[column].is_some() {
-        return;
+    if state.shards[index].is_some() {
+        return None;
     }
-    state.shards[column] = Some(msg.data);
+    state.shards[index] = Some(msg.data);
     state.payload_len = Some(msg.payload_len as usize);
     state.shard_len = Some(msg.shard_len as usize);
     state.payload_hash = Some(msg.payload_hash);
-    let distinct = state.distinct();
-    event!(
-        "shard_received",
-        column = column,
-        added = 1,
-        distinct = distinct
-    );
-    if state.chunks_reconstructed || distinct < PAYLOAD_DATA_SHARDS {
+    Some(state.distinct())
+}
+
+/// Decode once enough distinct shards are held, then suppress the rest.
+fn try_reconstruct_rs(
+    swarm: &mut Swarm<SimBehaviour>,
+    state: &mut RsSubnetState,
+    reconstructed: &mut bool,
+    layout: ShardTopics,
+    distinct: usize,
+) {
+    if state.chunks_reconstructed || distinct < state.params.data {
         return;
     }
     let (Some(payload_len), Some(shard_len), Some(hash)) =
@@ -748,11 +948,12 @@ fn handle_rs_subnets(
         .enumerate()
         .filter_map(|(i, s)| s.clone().map(|d| (i, d)))
         .collect();
-    match decode_payload(payload_len, shard_len, &hash, &present) {
+    match decode_payload_with(payload_len, shard_len, &hash, &present, state.params) {
         Ok((payload, full_shards)) => {
             state.chunks_reconstructed = true;
             let idontwant_peers = send_reconstructed_chunk_idontwants(
                 swarm,
+                layout,
                 payload_len,
                 shard_len,
                 hash,
@@ -772,7 +973,218 @@ fn handle_rs_subnets(
                 );
             }
         }
-        Err(err) => warn!(%err, "rs-subnets reconstruct failed"),
+        Err(err) => warn!(%err, "rs reconstruct failed"),
+    }
+}
+
+fn handle_rs_subnets(
+    swarm: &mut Swarm<SimBehaviour>,
+    state: &mut RsSubnetState,
+    reconstructed: &mut bool,
+    topic: &str,
+    data: &[u8],
+) {
+    let Some(column) = column_from_topic(topic) else {
+        return;
+    };
+    let Ok(msg) = ColumnShardMessage::decode(data) else {
+        return;
+    };
+    let Some(distinct) = merge_rs_shard(state, column, msg) else {
+        return;
+    };
+    event!(
+        "shard_received",
+        column = column,
+        added = 1,
+        distinct = distinct
+    );
+    try_reconstruct_rs(
+        swarm,
+        state,
+        reconstructed,
+        ShardTopics::PerColumn,
+        distinct,
+    );
+}
+
+/// Publish every RS shard as an ordinary Gossipsub message on one topic
+/// (mode `gossipsub-rs`).
+fn publish_gossipsub_rs(
+    swarm: &mut Swarm<SimBehaviour>,
+    payload: &[u8],
+    params: RsParams,
+    reconstructed: &mut bool,
+) {
+    let (shard_len, payload_hash, shards) = match encode_payload_shards_with(payload, params) {
+        Ok(encoded) => encoded,
+        Err(err) => {
+            warn!(%err, "gossipsub-rs encode failed");
+            return;
+        }
+    };
+    let mut published = 0usize;
+    for (index, data) in shards.into_iter().enumerate() {
+        let msg = ColumnShardMessage {
+            index: index as u16,
+            payload_len: payload.len() as u64,
+            shard_len: shard_len as u64,
+            payload_hash,
+            data,
+        };
+        match swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(payload_rs_topic(), msg.encode())
+        {
+            Ok(_) => published += 1,
+            Err(err) => warn!(shard = index, %err, "gossipsub-rs publish failed"),
+        }
+    }
+    event!(
+        "payload_published",
+        bytes = payload.len(),
+        hash = hex_bytes(&payload_hash),
+        shards = published,
+        shard_len = shard_len,
+        data_shards = params.data,
+        total_shards = params.total
+    );
+    mark_reconstructed(reconstructed, payload);
+}
+
+fn handle_gossipsub_rs(
+    swarm: &mut Swarm<SimBehaviour>,
+    state: &mut RsSubnetState,
+    reconstructed: &mut bool,
+    idontwant_message_id: Option<gossipsub::MessageId>,
+    data: &[u8],
+) {
+    let Ok(msg) = ColumnShardMessage::decode(data) else {
+        return;
+    };
+    // A single topic carries every shard, so the index comes from the message.
+    let index = msg.index as usize;
+    let Some(distinct) = merge_rs_shard(state, index, msg) else {
+        return;
+    };
+    event!(
+        "shard_received",
+        index = index,
+        added = 1,
+        distinct = distinct
+    );
+    if let Some(message_id) = idontwant_message_id {
+        let peers = swarm
+            .behaviour_mut()
+            .gossipsub
+            .send_idontwant_to_mesh(payload_rs_topic().hash(), [message_id]);
+        event!("shard_idontwant_sent", index = index, peers = peers);
+    }
+    try_reconstruct_rs(swarm, state, reconstructed, ShardTopics::Single, distinct);
+}
+
+/// Gossipsub topic hashes the event loop dispatches on.
+struct TopicHashes {
+    payload: gossipsub::TopicHash,
+    chunk: gossipsub::TopicHash,
+    chunked: gossipsub::TopicHash,
+    rs: gossipsub::TopicHash,
+}
+
+impl TopicHashes {
+    fn new() -> Self {
+        Self {
+            payload: payload_topic().hash(),
+            chunk: payload_chunk_topic().hash(),
+            chunked: payload_chunked_topic().hash(),
+            rs: payload_rs_topic().hash(),
+        }
+    }
+}
+
+/// Per-mode receive state. Exactly one variant is live for a run, so the mode
+/// that owns an incoming message is decided by the type rather than by which of
+/// several `Option`s happens to be populated.
+enum ModeState {
+    /// Modes that reconstruct directly from a full payload message.
+    FullPayload,
+    Chunked(GossipsubChunkAssembler),
+    ChunkSubnets(GossipsubChunkAssembler),
+    RsPartial(RsPartialState),
+    /// `rs-subnets`, plus `hybrid` nodes holding the chunk-subscriber role.
+    RsSubnets(RsSubnetState),
+    /// Every RS shard arriving on one topic.
+    GossipsubRs(RsSubnetState),
+    /// Boxed: `RlncState` embeds an RNG and dwarfs the other variants.
+    Rlnc(Box<RlncState>),
+}
+
+fn build_mode_state(cli: &Cli) -> ModeState {
+    match cli.mode {
+        Mode::RsPartial => ModeState::RsPartial(RsPartialState {
+            assembler: PayloadChunkAssembler::new(4),
+            header_tracker: PayloadChunkHeaderTracker::new(4),
+            recipients: cli.payload_chunk_recipients,
+        }),
+        Mode::GossipsubChunked => ModeState::Chunked(GossipsubChunkAssembler::new()),
+        Mode::ChunkSubnets => ModeState::ChunkSubnets(GossipsubChunkAssembler::new()),
+        Mode::GossipsubRs => ModeState::GossipsubRs(RsSubnetState::with_params(
+            gossipsub_rs_params(cli),
+            false,
+        )),
+        Mode::Rlnc => ModeState::Rlnc(Box::new(RlncState::new(
+            cli.rlnc_chunks,
+            cli.rlnc_fanout,
+            cli.seed,
+        ))),
+        // Covers rs-subnets and the hybrid chunk-subscriber role; a hybrid node
+        // without that role only ever sees full payload gossip.
+        _ if chunk_subscriber(cli.mode, cli.rs_subnet_subscriber) => {
+            ModeState::RsSubnets(RsSubnetState::new(cli.mode == Mode::Hybrid))
+        }
+        _ => ModeState::FullPayload,
+    }
+}
+
+/// Publish the payload once, in whichever shape this run's mode calls for.
+fn publish_payload(
+    swarm: &mut Swarm<SimBehaviour>,
+    cli: &Cli,
+    payload: &[u8],
+    reconstructed: &mut bool,
+    state: &mut ModeState,
+) {
+    match cli.mode {
+        Mode::RsPartial => {
+            if let ModeState::RsPartial(rs) = state {
+                publish_rs_partial(swarm, rs, payload, reconstructed);
+            }
+        }
+        Mode::GossipsubChunked => {
+            publish_gossipsub_chunked(swarm, payload, cli.gossipsub_chunk_count);
+            mark_reconstructed(reconstructed, payload);
+        }
+        Mode::RsSubnets => publish_rs_subnets(swarm, payload, reconstructed),
+        Mode::ChunkSubnets => {
+            publish_chunk_subnets(swarm, payload, cli.gossipsub_chunk_count);
+            mark_reconstructed(reconstructed, payload);
+        }
+        Mode::GossipsubRs => {
+            publish_gossipsub_rs(swarm, payload, gossipsub_rs_params(cli), reconstructed);
+        }
+        Mode::Hybrid if chunk_subscriber(cli.mode, cli.rs_subnet_subscriber) => {
+            publish_hybrid(swarm, payload, reconstructed);
+        }
+        Mode::Rlnc => {
+            if let ModeState::Rlnc(rlnc) = state {
+                publish_rlnc(swarm, rlnc, payload, reconstructed, cli.seed);
+            }
+        }
+        Mode::Gossipsub | Mode::Hybrid => {
+            publish_gossipsub(swarm, payload);
+            mark_reconstructed(reconstructed, payload);
+        }
     }
 }
 
@@ -780,29 +1192,24 @@ fn handle_swarm_event(
     swarm: &mut Swarm<SimBehaviour>,
     event: SwarmEvent<SimBehaviourEvent>,
     reconstructed: &mut bool,
-    payload_topic_hash: &gossipsub::TopicHash,
-    chunk_topic_hash: &gossipsub::TopicHash,
-    chunked_topic_hash: &gossipsub::TopicHash,
+    topics: &TopicHashes,
     chunked_send_idontwant: bool,
-    rs_partial: &mut Option<RsPartialState>,
-    rs_subnets: &mut Option<RsSubnetState>,
-    gossipsub_chunked: &mut Option<GossipsubChunkAssembler>,
-    rlnc: &mut Option<RlncState>,
+    state: &mut ModeState,
 ) {
     match event {
         SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             message,
             ..
-        })) if message.topic == *payload_topic_hash => {
+        })) if message.topic == topics.payload => {
             mark_reconstructed(reconstructed, &message.data);
         }
         SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             message_id, message, ..
-        })) if message.topic == *chunked_topic_hash => {
-            if let Some(state) = gossipsub_chunked.as_mut() {
+        })) if message.topic == topics.chunked => {
+            if let ModeState::Chunked(chunked) = state {
                 handle_gossipsub_chunked(
                     swarm,
-                    state,
+                    chunked,
                     reconstructed,
                     chunked_send_idontwant.then_some(message_id),
                     &message.data,
@@ -810,27 +1217,46 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-            message,
-            ..
-        })) => {
-            if let Some(state) = rs_subnets.as_mut() {
-                handle_rs_subnets(
+            message_id, message, ..
+        })) if message.topic == topics.rs => {
+            if let ModeState::GossipsubRs(shards) = state {
+                handle_gossipsub_rs(
                     swarm,
-                    state,
+                    shards,
                     reconstructed,
-                    message.topic.as_str(),
+                    chunked_send_idontwant.then_some(message_id),
                     &message.data,
                 );
             }
         }
+        SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            message_id, message, ..
+        })) => match state {
+            ModeState::ChunkSubnets(chunks) => handle_chunk_subnets(
+                swarm,
+                chunks,
+                reconstructed,
+                chunked_send_idontwant.then_some(message_id),
+                message.topic.as_str(),
+                &message.data,
+            ),
+            ModeState::RsSubnets(shards) => handle_rs_subnets(
+                swarm,
+                shards,
+                reconstructed,
+                message.topic.as_str(),
+                &message.data,
+            ),
+            _ => {}
+        },
         SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Partial {
             topic_hash,
             group_id,
             message,
             ..
-        })) if topic_hash == *chunk_topic_hash => {
-            if let Some(state) = rs_partial.as_mut() {
-                handle_rs_partial(swarm, state, reconstructed, &group_id, message);
+        })) if topic_hash == topics.chunk => {
+            if let ModeState::RsPartial(partial) = state {
+                handle_rs_partial(swarm, partial, reconstructed, &group_id, message);
             }
         }
         SwarmEvent::Behaviour(SimBehaviourEvent::Rlnc(request_response::Event::Message {
@@ -844,8 +1270,8 @@ fn handle_swarm_event(
             ..
         })) => {
             let _ = swarm.behaviour_mut().rlnc.send_response(channel, RlncAck);
-            if let Some(state) = rlnc.as_mut() {
-                handle_rlnc_packet(swarm, state, reconstructed, peer, request);
+            if let ModeState::Rlnc(rlnc) = state {
+                handle_rlnc_packet(swarm, rlnc, reconstructed, peer, request);
             }
         }
         _ => {}
@@ -976,11 +1402,13 @@ fn handle_rlnc_packet(
     rlnc_push(swarm, state, Some(from));
 }
 
-fn finish(swarm: &Swarm<SimBehaviour>, reconstructed: bool, rlnc: &Option<RlncState>) {
+fn finish(swarm: &Swarm<SimBehaviour>, reconstructed: bool, state: &ModeState) {
     let (mut tx, mut rx) = gossip_byte_totals(swarm);
-    if let Some(state) = rlnc {
-        tx += state.tx;
-        rx += state.rx;
+    // RLNC rides its own request-response protocol, so its bytes are not in the
+    // gossipsub counters.
+    if let ModeState::Rlnc(rlnc) = state {
+        tx += rlnc.tx;
+        rx += rlnc.rx;
     }
     event!("bytes", tx = tx, rx = rx);
     event!("run_end", reconstructed = reconstructed);
@@ -1008,9 +1436,32 @@ async fn main() {
 
     if !matches!(
         cli.mode,
-        Mode::Gossipsub | Mode::GossipsubChunked | Mode::RsPartial | Mode::RsSubnets | Mode::Hybrid | Mode::Rlnc
+        Mode::Gossipsub
+            | Mode::GossipsubChunked
+            | Mode::RsPartial
+            | Mode::RsSubnets
+            | Mode::ChunkSubnets
+            | Mode::GossipsubRs
+            | Mode::Hybrid
+            | Mode::Rlnc
     ) {
         eprintln!("error: mode {} is not implemented yet", cli.mode);
+        std::process::exit(1);
+    }
+
+    if cli.mode == Mode::GossipsubRs {
+        if let Err(error) = RsParams::new(cli.gossipsub_rs_data_shards, cli.gossipsub_rs_total_shards)
+        {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    }
+
+    if cli.mode == Mode::ChunkSubnets && cli.gossipsub_chunk_count > MAX_CHUNK_SUBNETS {
+        eprintln!(
+            "error: chunk-subnets supports at most {MAX_CHUNK_SUBNETS} chunks, got {}",
+            cli.gossipsub_chunk_count
+        );
         std::process::exit(1);
     }
 
@@ -1059,6 +1510,16 @@ async fn main() {
                     .expect("subscribe to column topic");
             }
         }
+        Mode::ChunkSubnets => {
+            // Every chunk is required, so every node subscribes to every subnet.
+            for i in 0..cli.gossipsub_chunk_count {
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .subscribe(&chunk_subnet_topic(i))
+                    .expect("subscribe to chunk subnet topic");
+            }
+        }
         Mode::Hybrid => {
             swarm
                 .behaviour_mut()
@@ -1089,21 +1550,8 @@ async fn main() {
     dial_peers(&mut swarm, &cli.peers);
 
     let payload = make_payload(cli.seed, cli.payload_size_kib.saturating_mul(1024));
-    let payload_topic_hash = payload_topic().hash();
-    let chunk_topic_hash = payload_chunk_topic().hash();
-    let chunked_topic_hash = payload_chunked_topic().hash();
-    let mut rs_partial = (cli.mode == Mode::RsPartial).then(|| RsPartialState {
-        assembler: PayloadChunkAssembler::new(4),
-        header_tracker: PayloadChunkHeaderTracker::new(4),
-        recipients: cli.payload_chunk_recipients,
-    });
-    let mut rs_subnets = chunk_subscriber(cli.mode, cli.rs_subnet_subscriber)
-        .then(|| RsSubnetState::new(cli.mode == Mode::Hybrid));
-    let mut gossipsub_chunked = (cli.mode == Mode::GossipsubChunked)
-        .then(GossipsubChunkAssembler::new);
-    let mut rlnc_state = (cli.mode == Mode::Rlnc).then(|| {
-        RlncState::new(cli.rlnc_chunks, cli.rlnc_fanout, cli.seed)
-    });
+    let topics = TopicHashes::new();
+    let mut mode_state = build_mode_state(&cli);
 
     let start = Instant::now();
     let warmup_min = Duration::from_secs(cli.warmup_secs);
@@ -1122,14 +1570,9 @@ async fn main() {
                     &mut swarm,
                     event,
                     &mut reconstructed,
-                    &payload_topic_hash,
-                    &chunk_topic_hash,
-                    &chunked_topic_hash,
+                    &topics,
                     cli.chunked_send_idontwant,
-                    &mut rs_partial,
-                    &mut rs_subnets,
-                    &mut gossipsub_chunked,
-                    &mut rlnc_state,
+                    &mut mode_state,
                 );
             }
             _ = tick.tick() => {
@@ -1148,53 +1591,19 @@ async fn main() {
                         );
                         warmup_done = true;
                         if cli.builder {
-                            match cli.mode {
-                                Mode::RsPartial => {
-                                    if let Some(state) = rs_partial.as_mut() {
-                                        publish_rs_partial(
-                                            &mut swarm,
-                                            state,
-                                            &payload,
-                                            &mut reconstructed,
-                                        );
-                                    }
-                                }
-                                Mode::GossipsubChunked => {
-                                    publish_gossipsub_chunked(
-                                        &mut swarm,
-                                        &payload,
-                                        cli.gossipsub_chunk_count,
-                                    );
-                                    mark_reconstructed(&mut reconstructed, &payload);
-                                }
-                                Mode::RsSubnets => {
-                                    publish_rs_subnets(&mut swarm, &payload, &mut reconstructed);
-                                }
-                                Mode::Hybrid if chunk_subscriber(cli.mode, cli.rs_subnet_subscriber) => {
-                                    publish_hybrid(&mut swarm, &payload, &mut reconstructed);
-                                }
-                                Mode::Rlnc => {
-                                    if let Some(state) = rlnc_state.as_mut() {
-                                        publish_rlnc(
-                                            &mut swarm,
-                                            state,
-                                            &payload,
-                                            &mut reconstructed,
-                                            cli.seed,
-                                        );
-                                    }
-                                }
-                                Mode::Gossipsub | Mode::Hybrid => {
-                                    publish_gossipsub(&mut swarm, &payload);
-                                    mark_reconstructed(&mut reconstructed, &payload);
-                                }
-                            }
+                            publish_payload(
+                                &mut swarm,
+                                &cli,
+                                &payload,
+                                &mut reconstructed,
+                                &mut mode_state,
+                            );
                         }
                         observe_until = Some(now + observe);
                     }
                 } else if let Some(deadline) = observe_until {
                     if now >= deadline {
-                        finish(&swarm, reconstructed, &rlnc_state);
+                        finish(&swarm, reconstructed, &mode_state);
                         break;
                     }
                 }
@@ -1261,6 +1670,185 @@ mod tests {
             "0",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn chunk_subnets_mode_reuses_the_chunk_count_and_sizes_its_topics() {
+        let cli = Cli::try_parse_from([
+            "ec-sim",
+            "--mode",
+            "chunk-subnets",
+            "--gossipsub-chunk-count",
+            "96",
+        ])
+        .unwrap();
+        assert_eq!(cli.mode, Mode::ChunkSubnets);
+        let tuning = gossip_tuning(&cli);
+        assert_eq!(tuning.chunk_subnet_count, 96);
+        assert!(tuning.validate().is_ok());
+    }
+
+    #[test]
+    fn other_modes_configure_no_chunk_subnet_topics() {
+        for mode in ["gossipsub", "gossipsub-chunked", "rs-subnets"] {
+            let cli = Cli::try_parse_from(["ec-sim", "--mode", mode]).unwrap();
+            assert_eq!(gossip_tuning(&cli).chunk_subnet_count, 0, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn chunk_subnets_mode_uses_its_own_topic_and_mesh_profile() {
+        assert_eq!(
+            mesh_topic(Mode::ChunkSubnets).to_string(),
+            chunk_subnet_topic(0).to_string()
+        );
+        let tuning = GossipTuning {
+            chunk_subnet: MeshTuning {
+                mesh_n: 50,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            primary_mesh_tuning(Mode::ChunkSubnets, &tuning),
+            tuning.chunk_subnet
+        );
+    }
+
+    #[test]
+    fn chunk_subnets_does_not_take_the_rs_subnet_role() {
+        assert!(!chunk_subscriber(Mode::ChunkSubnets, true));
+    }
+
+    #[test]
+    fn gossipsub_rs_defaults_to_the_standard_rate_and_its_own_topic() {
+        let cli = Cli::try_parse_from(["ec-sim", "--mode", "gossipsub-rs"]).unwrap();
+        assert_eq!(cli.mode, Mode::GossipsubRs);
+        assert_eq!(gossipsub_rs_params(&cli), RsParams::DEFAULT);
+        assert_eq!(
+            mesh_topic(Mode::GossipsubRs).to_string(),
+            payload_rs_topic().to_string()
+        );
+        // Single topic, so it must not be mistaken for a per-shard subnet.
+        assert!(!chunk_subscriber(Mode::GossipsubRs, true));
+        assert_eq!(column_from_topic(&payload_rs_topic().to_string()), None);
+    }
+
+    #[test]
+    fn gossipsub_rs_accepts_a_custom_rate_and_uses_its_mesh_profile() {
+        let cli = Cli::try_parse_from([
+            "ec-sim",
+            "--mode",
+            "gossipsub-rs",
+            "--gossipsub-rs-data-shards",
+            "64",
+            "--gossipsub-rs-total-shards",
+            "80",
+        ])
+        .unwrap();
+        let params = gossipsub_rs_params(&cli);
+        assert_eq!(params, RsParams { data: 64, total: 80 });
+        assert!(params.validate().is_ok());
+
+        let tuning = GossipTuning {
+            gossipsub_rs: MeshTuning {
+                mesh_n: 33,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            primary_mesh_tuning(Mode::GossipsubRs, &tuning),
+            tuning.gossipsub_rs
+        );
+    }
+
+    #[test]
+    fn gossipsub_rs_state_sizes_itself_to_the_configured_rate() {
+        let cli = Cli::try_parse_from([
+            "ec-sim",
+            "--mode",
+            "gossipsub-rs",
+            "--gossipsub-rs-data-shards",
+            "32",
+            "--gossipsub-rs-total-shards",
+            "48",
+        ])
+        .unwrap();
+        match build_mode_state(&cli) {
+            ModeState::GossipsubRs(state) => {
+                assert_eq!(state.shards.len(), 48);
+                assert_eq!(state.params.data, 32);
+                // gossipsub-rs never bridges a full payload; that is hybrid's job.
+                assert!(!state.bridge_payload);
+            }
+            _ => panic!("expected a gossipsub-rs state"),
+        }
+    }
+
+    #[test]
+    fn a_shard_is_merged_once_and_only_at_its_own_index() {
+        let payload = make_payload(11, 4096);
+        let params = RsParams::new(32, 48).unwrap();
+        let (shard_len, hash, shards) = encode_payload_shards_with(&payload, params).unwrap();
+        let message = |index: usize| ColumnShardMessage {
+            index: index as u16,
+            payload_len: payload.len() as u64,
+            shard_len: shard_len as u64,
+            payload_hash: hash,
+            data: shards[index].clone(),
+        };
+        let mut state = RsSubnetState::with_params(params, false);
+
+        assert_eq!(merge_rs_shard(&mut state, 0, message(0)), Some(1));
+        // Duplicate index contributes nothing.
+        assert_eq!(merge_rs_shard(&mut state, 0, message(0)), None);
+        // Shard claiming an index other than where it arrived is rejected.
+        assert_eq!(merge_rs_shard(&mut state, 1, message(2)), None);
+        // Index beyond the configured rate is rejected.
+        assert_eq!(merge_rs_shard(&mut state, 48, message(3)), None);
+        assert_eq!(merge_rs_shard(&mut state, 1, message(1)), Some(2));
+    }
+
+    #[test]
+    fn single_topic_suppression_batches_every_shard_id_into_one_topic() {
+        // The per-column layout addresses a distinct topic per shard, while the
+        // single-topic layout must reuse one topic for all of them.
+        let per_column: Vec<_> = (0..4).map(|i| ShardTopics::PerColumn.topic_for(i)).collect();
+        assert_eq!(
+            per_column.iter().collect::<std::collections::HashSet<_>>().len(),
+            4
+        );
+        let single: Vec<_> = (0..4).map(|i| ShardTopics::Single.topic_for(i)).collect();
+        assert!(single.iter().all(|t| *t == payload_rs_topic().hash()));
+    }
+
+    #[test]
+    fn each_chunk_lands_on_the_subnet_matching_its_index() {
+        // The receive path accepts a chunk only when its index equals the subnet
+        // parsed from the topic, so publishing must keep the two aligned.
+        let payload = make_payload(42, 8 * 1024);
+        let chunks = split_payload(&payload, 64).unwrap();
+        assert_eq!(chunks.len(), 64);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let topic = chunk_subnet_topic(index).to_string();
+            assert_eq!(chunk_subnet_from_topic(&topic), Some(index));
+            assert_eq!(chunk.index as usize, index);
+        }
+    }
+
+    #[test]
+    fn chunk_subnets_reconstructs_only_after_every_chunk_arrives() {
+        let payload = make_payload(7, 8 * 1024);
+        let mut chunks = split_payload(&payload, 64).unwrap();
+        // Reverse arrival order: no erasure slack, so the last chunk decides.
+        chunks.reverse();
+        let mut assembler = GossipsubChunkAssembler::new();
+        let last = chunks.pop().unwrap();
+        for chunk in chunks {
+            assert!(assembler.merge(chunk).payload.is_none());
+        }
+        assert_eq!(assembler.merge(last).payload, Some(payload));
     }
 
     #[test]
@@ -1347,7 +1935,8 @@ mod tests {
             .enumerate()
             .collect();
         let (_, reconstructed_shards) =
-            decode_payload(payload.len(), shard_len, &hash, &initial).unwrap();
+            decode_payload_with(payload.len(), shard_len, &hash, &initial, RsParams::DEFAULT)
+                .unwrap();
 
         for (index, (published, reconstructed)) in
             shards.iter().zip(reconstructed_shards.iter()).enumerate()

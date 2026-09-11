@@ -21,8 +21,15 @@ pub const TOPIC_PAYLOAD_CHUNKS: &str = "/ec/payload_chunks/1";
 /// Raw normal-Gossipsub chunk topic (mode `gossipsub-chunked`).
 pub const TOPIC_PAYLOAD_CHUNKED: &str = "/ec/payload_chunked/1";
 
+/// Single-topic Reed-Solomon shard topic (mode `gossipsub-rs`).
+pub const TOPIC_PAYLOAD_RS: &str = "/ec/payload_rs/1";
+
 /// Number of column subnets (one gossipsub topic per RS shard).
 pub const NUM_COLUMNS: usize = 128;
+
+/// Upper bound on chunk subnets (mode `chunk-subnets`). Each subnet gets its own
+/// per-topic mesh entry in the gossipsub config, so the count is capped.
+pub const MAX_CHUNK_SUBNETS: usize = 512;
 
 /// Gossipsub topic for the naive full-payload path.
 pub fn payload_topic() -> IdentTopic {
@@ -39,6 +46,11 @@ pub fn payload_chunked_topic() -> IdentTopic {
     IdentTopic::new(TOPIC_PAYLOAD_CHUNKED)
 }
 
+/// Gossipsub topic carrying every RS shard on one mesh (mode `gossipsub-rs`).
+pub fn payload_rs_topic() -> IdentTopic {
+    IdentTopic::new(TOPIC_PAYLOAD_RS)
+}
+
 /// Gossipsub topic for column subnet `column` (mode `rs-subnets`).
 pub fn column_topic(column: usize) -> IdentTopic {
     IdentTopic::new(format!("/ec/payload_column/{column}/1"))
@@ -50,6 +62,19 @@ pub fn column_from_topic(topic: &str) -> Option<usize> {
     let idx = rest.strip_suffix("/1")?;
     let column: usize = idx.parse().ok()?;
     (column < NUM_COLUMNS).then_some(column)
+}
+
+/// Gossipsub topic for raw chunk subnet `index` (mode `chunk-subnets`).
+pub fn chunk_subnet_topic(index: usize) -> IdentTopic {
+    IdentTopic::new(format!("/ec/payload_chunk_subnet/{index}/1"))
+}
+
+/// Parse `/ec/payload_chunk_subnet/{i}/1` into the chunk index.
+pub fn chunk_subnet_from_topic(topic: &str) -> Option<usize> {
+    let rest = topic.strip_prefix("/ec/payload_chunk_subnet/")?;
+    let idx = rest.strip_suffix("/1")?;
+    let index: usize = idx.parse().ok()?;
+    (index < MAX_CHUNK_SUBNETS).then_some(index)
 }
 
 /// The composed libp2p behaviour for the simulator.
@@ -120,6 +145,14 @@ pub struct GossipTuning {
     pub partial: MeshTuning,
     /// Mesh degrees for the raw normal-Gossipsub chunk topic.
     pub chunked: MeshTuning,
+    /// Mesh degrees for every raw chunk subnet topic.
+    pub chunk_subnet: MeshTuning,
+    /// Mesh degrees for the single-topic RS shard topic.
+    pub gossipsub_rs: MeshTuning,
+    /// Number of chunk subnet topics to configure. Only `chunk-subnets` runs set
+    /// this; other modes leave it at zero so they do not pay for unused
+    /// per-topic mesh entries.
+    pub chunk_subnet_count: usize,
 }
 
 impl Default for GossipTuning {
@@ -132,6 +165,9 @@ impl Default for GossipTuning {
             subnet: MeshTuning::default(),
             partial: MeshTuning::default(),
             chunked: MeshTuning::default(),
+            chunk_subnet: MeshTuning::default(),
+            gossipsub_rs: MeshTuning::default(),
+            chunk_subnet_count: 0,
         }
     }
 }
@@ -166,7 +202,16 @@ impl GossipTuning {
         Self::validate_mesh_tuple(self.execution, "execution")?;
         Self::validate_mesh_tuple(self.subnet, "subnet")?;
         Self::validate_mesh_tuple(self.partial, "partial")?;
-        Self::validate_mesh_tuple(self.chunked, "chunked")
+        Self::validate_mesh_tuple(self.chunked, "chunked")?;
+        Self::validate_mesh_tuple(self.chunk_subnet, "chunk_subnet")?;
+        Self::validate_mesh_tuple(self.gossipsub_rs, "gossipsub_rs")?;
+        if self.chunk_subnet_count > MAX_CHUNK_SUBNETS {
+            return Err(format!(
+                "chunk subnet count must be at most {MAX_CHUNK_SUBNETS}, got {}",
+                self.chunk_subnet_count
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -220,8 +265,16 @@ fn gossipsub_config(tuning: &GossipTuning) -> gossipsub::Config {
     configure_topic_mesh(&mut builder, payload_topic().hash(), tuning.execution);
     configure_topic_mesh(&mut builder, payload_chunk_topic().hash(), tuning.partial);
     configure_topic_mesh(&mut builder, payload_chunked_topic().hash(), tuning.chunked);
+    configure_topic_mesh(&mut builder, payload_rs_topic().hash(), tuning.gossipsub_rs);
     for column in 0..NUM_COLUMNS {
         configure_topic_mesh(&mut builder, column_topic(column).hash(), tuning.subnet);
+    }
+    for index in 0..tuning.chunk_subnet_count.min(MAX_CHUNK_SUBNETS) {
+        configure_topic_mesh(
+            &mut builder,
+            chunk_subnet_topic(index).hash(),
+            tuning.chunk_subnet,
+        );
     }
     builder.build().expect("valid gossipsub config")
 }
@@ -417,6 +470,19 @@ mod tests {
                 mesh_n_high: 40,
                 mesh_outbound_min: 8,
             },
+            chunk_subnet: MeshTuning {
+                mesh_n: 6,
+                mesh_n_low: 5,
+                mesh_n_high: 9,
+                mesh_outbound_min: 3,
+            },
+            gossipsub_rs: MeshTuning {
+                mesh_n: 14,
+                mesh_n_low: 10,
+                mesh_n_high: 18,
+                mesh_outbound_min: 5,
+            },
+            chunk_subnet_count: 64,
             ..Default::default()
         };
         let config = gossipsub_config(&tuning);
@@ -425,8 +491,11 @@ mod tests {
             (payload_topic(), tuning.execution),
             (payload_chunk_topic(), tuning.partial),
             (payload_chunked_topic(), tuning.chunked),
+            (payload_rs_topic(), tuning.gossipsub_rs),
             (column_topic(0), tuning.subnet),
             (column_topic(NUM_COLUMNS - 1), tuning.subnet),
+            (chunk_subnet_topic(0), tuning.chunk_subnet),
+            (chunk_subnet_topic(63), tuning.chunk_subnet),
         ] {
             let hash = topic.hash();
             assert_eq!(config.mesh_n_for_topic(&hash), expected.mesh_n);
@@ -504,5 +573,68 @@ mod tests {
     #[test]
     fn every_payload_shard_has_a_column_topic() {
         assert_eq!(NUM_COLUMNS, crate::coding::PAYLOAD_TOTAL_SHARDS);
+    }
+
+    #[test]
+    fn chunk_subnet_topic_round_trips() {
+        for i in [0usize, 1, 63, MAX_CHUNK_SUBNETS - 1] {
+            let topic = chunk_subnet_topic(i);
+            assert_eq!(chunk_subnet_from_topic(&topic.to_string()), Some(i));
+        }
+        assert_eq!(
+            chunk_subnet_from_topic(&chunk_subnet_topic(MAX_CHUNK_SUBNETS).to_string()),
+            None
+        );
+        assert_eq!(chunk_subnet_from_topic("/ec/payload_chunk_subnet/7"), None);
+    }
+
+    #[test]
+    fn chunk_subnet_and_column_topics_do_not_collide() {
+        let chunk = chunk_subnet_topic(0).to_string();
+        assert_eq!(column_from_topic(&chunk), None);
+        let column = column_topic(0).to_string();
+        assert_eq!(chunk_subnet_from_topic(&column), None);
+        assert_ne!(chunk, column);
+    }
+
+    #[test]
+    fn chunk_subnet_count_beyond_the_cap_is_rejected() {
+        let tuning = GossipTuning {
+            chunk_subnet_count: MAX_CHUNK_SUBNETS + 1,
+            ..Default::default()
+        };
+        let err = tuning.validate().expect_err("count above the cap");
+        assert!(err.contains("chunk subnet count"), "{err}");
+
+        let at_cap = GossipTuning {
+            chunk_subnet_count: MAX_CHUNK_SUBNETS,
+            ..Default::default()
+        };
+        assert!(at_cap.validate().is_ok());
+    }
+
+    #[test]
+    fn modes_other_than_chunk_subnets_configure_no_chunk_subnet_topics() {
+        // chunk_subnet_count = 0 leaves the topics on the generic fallback, so a
+        // gossipsub or rs-subnets run does not pay for unused mesh entries.
+        let tuning = GossipTuning {
+            execution: MeshTuning {
+                mesh_n: 8,
+                mesh_n_low: 4,
+                mesh_n_high: 12,
+                mesh_outbound_min: 3,
+            },
+            chunk_subnet: MeshTuning {
+                mesh_n: 6,
+                mesh_n_low: 5,
+                mesh_n_high: 9,
+                mesh_outbound_min: 3,
+            },
+            chunk_subnet_count: 0,
+            ..Default::default()
+        };
+        let config = gossipsub_config(&tuning);
+        let hash = chunk_subnet_topic(0).hash();
+        assert_eq!(config.mesh_n_for_topic(&hash), tuning.execution.mesh_n);
     }
 }

@@ -12,8 +12,8 @@
 runner = "docker"
 
 [sim]
-mode = "rs-partial"           # gossipsub | gossipsub-chunked | rs-partial | rs-subnets | hybrid | rlnc
-title = "rs-partial" # label shown in summary.html
+mode = "gossipsub-rs"           # gossipsub | gossipsub-chunked | gossipsub-rs | rs-partial | rs-subnets | chunk-subnets | hybrid | rlnc
+title = "gossipsub-rs-256kb" # label shown in summary.html
 seed = 42                     # master RNG seed (topology + per-node keypairs)
 runs = 1                      # number of runs; run i uses seed+i
 payload_size_kib = 256        # payload the builder publishes once after warmup
@@ -22,9 +22,15 @@ observe_secs = 20             # window after publish before every node exits
 # rs-partial tuned profile (128 nodes, seed 42): 3 recipients/shard; mesh
 # 60/80/90 with 18 outbound peers. Validated at 128/128 reconstructed, t95=856 ms.
 payload_chunk_recipients = 3  # rs-partial: mesh peers seeded per shard
-gossipsub_chunk_count = 64    # gossipsub-chunked: raw payload chunks
-chunked_send_idontwant = false # gossipsub-chunked: notify mesh peers after each accepted chunk
+gossipsub_chunk_count = 64    # gossipsub-chunked / chunk-subnets: raw payload chunks
+chunked_send_idontwant = false # gossipsub-chunked / chunk-subnets: notify mesh peers after each accepted chunk
 chunked_gossip_lazy = 0       # gossipsub-chunked: D_lazy (other modes use gossip_lazy)
+# gossipsub-rs: RS rate for the single shard topic. Any `data_shards` of
+# `total_shards` reconstruct, so total/data is the bandwidth multiplier:
+# 64-of-128 doubles the bytes on the wire, 64-of-80 costs only 1.25x.
+# Reed-Solomon over GF(2^8) caps total_shards at 256.
+gossipsub_rs_data_shards = 64
+gossipsub_rs_total_shards = 128
 rlnc_chunks = 15              # RLNC source-packet count N
 rlnc_fanout = 18              # RLNC push degree D (independent of gossipsub meshes)
 # hybrid: every node receives full payload gossip; selected nodes also receive
@@ -43,8 +49,9 @@ gossip_factor = 0.00
 # Per-topic mesh sizing. Every profile must satisfy:
 #   <profile>_mesh_outbound_min <= <profile>_mesh_n_low <= <profile>_mesh_n <= <profile>_mesh_n_high
 #   and 2 * <profile>_mesh_outbound_min <= <profile>_mesh_n
-# The execution, chunked, and partial topics are broadly subscribed; column
-# subnets are subscribed only by hybrid nodes, so they use a smaller mesh.
+# The execution, chunked, partial, and chunk-subnet topics are broadly
+# subscribed; RS column subnets are subscribed only by hybrid nodes, so they use
+# a smaller mesh.
 execution_mesh_n_low = 4
 execution_mesh_n = 8
 execution_mesh_n_high = 12
@@ -64,6 +71,21 @@ subnet_mesh_n_low = 1
 subnet_mesh_n = 3
 subnet_mesh_n_high = 5
 subnet_mesh_outbound_min = 1
+
+# chunk-subnets needs *every* chunk, so it has no erasure slack: a mesh as sparse
+# as the RS column subnets would strand nodes that miss a single chunk. Start
+# from the chunked degrees instead.
+chunk_subnet_mesh_n_low = 4
+chunk_subnet_mesh_n = 8
+chunk_subnet_mesh_n_high = 12
+chunk_subnet_mesh_outbound_min = 3
+
+# gossipsub-rs carries every shard on one broadly subscribed topic, so it uses
+# execution-sized degrees rather than the sparse per-subnet ones.
+gossipsub_rs_mesh_n_low = 4
+gossipsub_rs_mesh_n = 8
+gossipsub_rs_mesh_n_high = 12
+gossipsub_rs_mesh_outbound_min = 3
 
 rust_log = "info"
 # stop_time = "90s"           # optional; default = warmup_secs + observe_secs + 60s
